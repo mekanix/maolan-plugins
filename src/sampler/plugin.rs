@@ -33,6 +33,7 @@ use clap_clap::{
     stream::{IStream, OStream},
 };
 use parking_lot::Mutex;
+use portable_atomic::AtomicF32;
 use portable_atomic::AtomicF64;
 
 use crate::common::filter::{FilterParams, FilterSubtype, FilterType};
@@ -122,6 +123,8 @@ pub struct SharedState {
     pending_note_off: AtomicU64,
     /// Monotonically increasing sequence number for GUI note events.
     note_sequence: AtomicU64,
+    output_level_left_db: AtomicF32,
+    output_level_right_db: AtomicF32,
 }
 
 impl Default for SharedState {
@@ -157,6 +160,8 @@ impl Default for SharedState {
             pending_note_on: AtomicU64::new(0),
             pending_note_off: AtomicU64::new(0),
             note_sequence: AtomicU64::new(1),
+            output_level_left_db: AtomicF32::new(-90.0),
+            output_level_right_db: AtomicF32::new(-90.0),
         }
     }
 }
@@ -173,6 +178,20 @@ impl SharedState {
 
     fn set_sample_rate(&self, sample_rate: f64) {
         self.sample_rate.store(sample_rate, Ordering::Release);
+    }
+
+    pub fn output_levels_db(&self) -> [f32; 2] {
+        [
+            self.output_level_left_db.load(Ordering::Relaxed),
+            self.output_level_right_db.load(Ordering::Relaxed),
+        ]
+    }
+
+    fn set_output_levels_db(&self, left: f32, right: f32) {
+        self.output_level_left_db
+            .store(left.clamp(-90.0, 20.0), Ordering::Relaxed);
+        self.output_level_right_db
+            .store(right.clamp(-90.0, 20.0), Ordering::Relaxed);
     }
 
     pub fn set_param_outbound_only(&self, id: ParamId, value: f64) {
@@ -840,6 +859,15 @@ fn emit_pending_param_events_to_host_sampler(
     }
 }
 
+fn peak_db(samples: &[f32]) -> f32 {
+    let peak = crate::simd::peak_abs(samples);
+    if peak > 0.0 {
+        20.0 * peak.log10()
+    } else {
+        -90.0
+    }
+}
+
 fn lfo_params(store: &ParamStore<ParamId>, index: usize) -> LfoParams {
     let (rate, amount, shape, enabled, deform, phase, trigger, unipolar, sync_mode) = match index {
         0 => (
@@ -947,14 +975,14 @@ fn filter_params(store: &ParamStore<ParamId>, ids: FilterParamIds) -> FilterPara
     }
 }
 
-fn build_zones_from_patch(patch: &Patch) -> Vec<SampleZone> {
+pub(crate) fn build_zones_from_patch(patch: &Patch) -> Vec<SampleZone> {
     let mut zones = Vec::new();
     for part in &patch.parts {
         for group in &part.groups {
             for zone in &group.zones {
                 let mut sample_zone = SampleZone::new_basic(
                     zone.name.clone(),
-                    Vec::new(),
+                    zone.files.clone(),
                     zone.key_low as usize,
                     zone.key_high as usize,
                     zone.vel_low,
@@ -1014,7 +1042,7 @@ fn build_zones_from_patch(patch: &Patch) -> Vec<SampleZone> {
     zones
 }
 
-fn build_groups_from_patch(patch: &Patch) -> Vec<SampleGroup> {
+pub(crate) fn build_groups_from_patch(patch: &Patch) -> Vec<SampleGroup> {
     let mut groups = Vec::new();
     for part in &patch.parts {
         for group in &part.groups {
@@ -1183,6 +1211,7 @@ fn build_dsp_zone(zone: &SampleZone, sample_rate: f32) -> Zone {
     dsp_zone.off_by = zone.off_by;
     dsp_zone.mod_matrix = zone.mod_matrix.clone();
     dsp_zone.extra_sfz_opcodes = zone.extra_sfz_opcodes.clone();
+    dsp_zone.files = zone.files.clone();
     dsp_zone
 }
 
@@ -1463,11 +1492,11 @@ impl AudioProcessor {
             self.last_patch_version = patch_version;
         }
 
-        if let Some((note, velocity)) = shared.drain_pending_note_on() {
-            self.engine.note_on(note, velocity, 0);
-        }
         if let Some(note) = shared.drain_pending_note_off() {
             self.engine.note_off(note, 0);
+        }
+        if let Some((note, velocity)) = shared.drain_pending_note_on() {
+            self.engine.note_on(note, velocity, 0);
         }
 
         let events = process.in_events();
@@ -1566,6 +1595,11 @@ impl AudioProcessor {
         }
         self.engine
             .process_group_outputs(&mut self.group_outputs[..group_output_count], frames);
+        if let Some((out_l, out_r)) = self.group_outputs.first() {
+            shared.set_output_levels_db(peak_db(&out_l[..frames]), peak_db(&out_r[..frames]));
+        } else {
+            shared.set_output_levels_db(-90.0, -90.0);
+        }
 
         for port_index in 0..process.audio_outputs_count() {
             let mut out_port = process.audio_outputs(port_index);
@@ -2313,6 +2347,7 @@ pub unsafe fn clap_create_plugin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn sampler_apply_param_id_handles_all_param_ids() {
@@ -2328,19 +2363,21 @@ mod tests {
 
     #[test]
     fn build_zones_from_patch_maps_dsp_zones_to_sample_zones() {
+        let mut hard = Zone::new_round_robin(
+            String::from("Kick Hard"),
+            Arc::new(Sample::silent(48_000.0)),
+            36,
+            (36, 42),
+            (100, 127),
+            Vec::new(),
+        );
+        hard.files = vec![PathBuf::from("kick_hard.wav")];
         let patch = Patch {
             parts: vec![Part {
                 groups: vec![Group {
                     name: String::from("Kick"),
                     zones: vec![
-                        Zone::new_round_robin(
-                            String::from("Kick Hard"),
-                            Arc::new(Sample::silent(48_000.0)),
-                            36,
-                            (36, 42),
-                            (100, 127),
-                            Vec::new(),
-                        ),
+                        hard,
                         Zone::new_round_robin(
                             String::from("Kick Soft"),
                             Arc::new(Sample::silent(48_000.0)),
@@ -2365,7 +2402,8 @@ mod tests {
         assert_eq!(zones[0].vel_low, 100);
         assert_eq!(zones[0].vel_high, 127);
         assert_eq!(zones[0].group, "Kick");
-        assert!(zones[0].files.is_empty());
+        assert_eq!(zones[0].files, vec![PathBuf::from("kick_hard.wav")]);
+        assert!(zones[1].files.is_empty());
         assert_eq!(zones[1].name, "Kick Soft");
         assert_eq!(zones[1].vel_low, 0);
         assert_eq!(zones[1].vel_high, 99);

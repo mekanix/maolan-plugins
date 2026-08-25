@@ -136,6 +136,11 @@ pub struct Zone {
     pub sample: Arc<Sample>,
     pub name: String,
 
+    /// Source audio file path(s) for this zone. Populated by the SFZ loader so
+    /// the GUI sample editor can reload the waveform without going through the
+    /// in-memory `Sample`. SF2/embedded samples leave this empty.
+    pub files: Vec<std::path::PathBuf>,
+
     pub root_key: u8,
 
     pub key_low: u8,
@@ -245,6 +250,7 @@ impl Clone for Zone {
         Self {
             sample: self.sample.clone(),
             name: self.name.clone(),
+            files: self.files.clone(),
             root_key: self.root_key,
             key_low: self.key_low,
             key_high: self.key_high,
@@ -310,6 +316,7 @@ impl Default for Zone {
         Self {
             sample: Arc::new(Sample::silent(48000.0)),
             name: String::new(),
+            files: Vec::new(),
             root_key: 60,
             key_low: 0,
             key_high: 127,

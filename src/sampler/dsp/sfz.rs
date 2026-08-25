@@ -928,7 +928,7 @@ fn push_extra_sfz_opcodes(output: &mut String, opcodes: &[(String, String)]) {
     }
 }
 
-fn write_wav_stereo(path: &Path, sample: &Sample) -> std::io::Result<()> {
+pub(crate) fn write_wav_stereo(path: &Path, sample: &Sample) -> std::io::Result<()> {
     let channels = 2u16;
     let bits_per_sample = 32u16;
     let bytes_per_sample = bits_per_sample / 8;
@@ -1659,6 +1659,7 @@ fn build_zone(
     let mut zone = Zone::default();
     zone.sample = sample.clone();
     zone.name = sample_path.to_string();
+    zone.files = vec![full_path.clone()];
 
     // Key mapping.
     if let Some(key) = get_note(opcodes, "key") {
