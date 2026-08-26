@@ -27,6 +27,10 @@ pub struct Part {
     pub aux_sends: [AuxSend; 4],
 
     pub microtuning: Option<Tuning>,
+
+    pub last_keyswitch_note: Option<u8>,
+
+    pub previous_note: Option<u8>,
 }
 
 impl Default for Part {
@@ -44,6 +48,8 @@ impl Default for Part {
             bus: Bus::default(),
             aux_sends: [AuxSend::default(); 4],
             microtuning: None,
+            last_keyswitch_note: None,
+            previous_note: None,
         }
     }
 }
@@ -56,9 +62,10 @@ impl Part {
         channel: u8,
         cc_values: &[u8; 128],
         pitch_bend_raw: i16,
+        held_notes: &[bool; 128],
     ) -> Option<(usize, &Group, &Zone)> {
         for (gi, group) in self.groups.iter().enumerate() {
-            if !crate::sampler::dsp::group::group_is_active(group, self, cc_values) {
+            if !crate::sampler::dsp::group::group_is_active(group, self, cc_values, held_notes) {
                 continue;
             }
             if let Some(zone) = group.find_zone(note, velocity, channel, cc_values, pitch_bend_raw)
@@ -67,45 +74,5 @@ impl Part {
             }
         }
         None
-    }
-
-    pub fn handle_keyswitch_on(&mut self, note: u8) {
-        let mut activated = false;
-        for group in &mut self.groups {
-            if group.trigger_type == crate::sampler::dsp::group::TriggerType::KeyswitchLatch
-                && group.trigger_note == note
-            {
-                group.trigger_active = true;
-                activated = true;
-            }
-        }
-
-        if activated {
-            for group in &mut self.groups {
-                if group.trigger_type == crate::sampler::dsp::group::TriggerType::KeyswitchLatch
-                    && group.trigger_note != note
-                {
-                    group.trigger_active = false;
-                }
-            }
-        }
-
-        for group in &mut self.groups {
-            if group.trigger_type == crate::sampler::dsp::group::TriggerType::KeyswitchMomentary
-                && group.trigger_note == note
-            {
-                group.trigger_active = true;
-            }
-        }
-    }
-
-    pub fn handle_keyswitch_off(&mut self, note: u8) {
-        for group in &mut self.groups {
-            if group.trigger_type == crate::sampler::dsp::group::TriggerType::KeyswitchMomentary
-                && group.trigger_note == note
-            {
-                group.trigger_active = false;
-            }
-        }
     }
 }

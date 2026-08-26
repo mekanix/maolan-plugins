@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
 use rand::random;
+use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LfoShape {
     Sine = 0,
     Triangle = 1,
@@ -33,6 +34,21 @@ impl LfoShape {
         }
     }
 
+    pub fn all() -> [Self; 10] {
+        [
+            LfoShape::Sine,
+            LfoShape::Triangle,
+            LfoShape::Saw,
+            LfoShape::Ramp,
+            LfoShape::Square,
+            LfoShape::SampleHold,
+            LfoShape::Noise,
+            LfoShape::Envelope,
+            LfoShape::StepSeq,
+            LfoShape::Mseg,
+        ]
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             LfoShape::Sine => "Sine",
@@ -55,7 +71,7 @@ impl std::fmt::Display for LfoShape {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LfoTriggerMode {
     FreeRun = 0,
     KeyTrigger = 1,
@@ -72,7 +88,7 @@ impl LfoTriggerMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LfoSyncMode {
     Free = 0,
     Tempo = 1,
@@ -451,6 +467,11 @@ pub struct Lfo {
     mseg_phase: f32,
     pub mseg_seg_changed: bool,
     pub mseg_prev_seg: usize,
+
+    lfo_delay: f32,
+    lfo_fade: f32,
+    lfo_delay_phase: f32,
+    lfo_fade_phase: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -502,6 +523,10 @@ impl Lfo {
             mseg_phase: 0.0,
             mseg_seg_changed: false,
             mseg_prev_seg: 0,
+            lfo_delay: 0.0,
+            lfo_fade: 0.0,
+            lfo_delay_phase: 0.0,
+            lfo_fade_phase: 0.0,
         }
     }
 
@@ -577,6 +602,14 @@ impl Lfo {
         self.env_release = release.max(0.0);
     }
 
+    pub fn set_lfo_delay(&mut self, delay: f32) {
+        self.lfo_delay = delay.max(0.0);
+    }
+
+    pub fn set_lfo_fade(&mut self, fade: f32) {
+        self.lfo_fade = fade.max(0.0);
+    }
+
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
     }
@@ -595,6 +628,8 @@ impl Lfo {
         self.phase_offset = 0.0;
         self.stepseq.reset();
         self.mseg_phase = 0.0;
+        self.lfo_delay_phase = 0.0;
+        self.lfo_fade_phase = 0.0;
     }
 
     pub fn release(&mut self) {
@@ -821,11 +856,39 @@ impl Lfo {
             1.0
         };
 
-        let mut out = raw * env_val * self.amount;
+        let fade_env = self.update_lfo_delay_fade();
+
+        let mut out = raw * env_val * fade_env * self.amount;
         if self.unipolar {
             out = (out + 1.0) * 0.5;
         }
         out
+    }
+
+    fn update_lfo_delay_fade(&mut self) -> f32 {
+        let dt = 1.0 / self.sample_rate;
+
+        if self.lfo_delay > 0.0 && self.lfo_delay_phase < 1.0 {
+            self.lfo_delay_phase += dt / self.lfo_delay;
+            if self.lfo_delay_phase >= 1.0 {
+                self.lfo_delay_phase = 1.0;
+            }
+            return 0.0;
+        }
+
+        if self.lfo_fade > 0.0 {
+            if self.lfo_fade_phase < 1.0 {
+                self.lfo_fade_phase += dt / self.lfo_fade;
+                if self.lfo_fade_phase >= 1.0 {
+                    self.lfo_fade_phase = 1.0;
+                    return 1.0;
+                }
+                return self.lfo_fade_phase;
+            }
+            return 1.0;
+        }
+
+        1.0
     }
 
     fn update_env(&mut self) {
@@ -913,5 +976,50 @@ impl Lfo {
         for sample in out.iter_mut() {
             *sample = self.next();
         }
+    }
+}
+
+#[cfg(test)]
+mod lfo_tests {
+    use super::*;
+
+    #[test]
+    fn lfo_delay_keeps_output_zero() {
+        let mut lfo = Lfo::new(48000.0);
+        lfo.set_rate_hz(10.0);
+        lfo.set_amount(1.0);
+        lfo.set_shape(LfoShape::Sine);
+        lfo.set_lfo_delay(0.01);
+        lfo.reset();
+
+        let mut block = [0.0f32; 480];
+        lfo.process_block(&mut block);
+
+        assert!(
+            block.iter().all(|&s| s == 0.0),
+            "LFO output should be zero during the delay stage"
+        );
+    }
+
+    #[test]
+    fn lfo_fade_ramps_amplitude_up() {
+        let mut lfo = Lfo::new(48000.0);
+        lfo.set_rate_hz(10.0);
+        lfo.set_amount(1.0);
+        lfo.set_shape(LfoShape::Sine);
+        lfo.set_lfo_fade(0.005);
+        lfo.reset();
+
+        // Fade over ~240 samples. First block should start near zero and grow.
+        let mut block = [0.0f32; 240];
+        lfo.process_block(&mut block);
+
+        let first = block.first().copied().unwrap_or(0.0).abs();
+        let last = block.last().copied().unwrap_or(0.0).abs();
+        assert!(
+            first < 0.1,
+            "LFO should start near zero during fade: {first}"
+        );
+        assert!(last > first, "LFO amplitude should increase during fade");
     }
 }

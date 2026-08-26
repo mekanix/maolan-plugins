@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::envelope::AdsrParams;
@@ -6,7 +7,7 @@ use crate::common::voice::{PlayMode, StealMode, VoicePriority};
 use crate::sampler::dsp::mod_matrix::ModMatrix;
 use crate::sampler::dsp::patch::Patch;
 use crate::sampler::dsp::sample::Sample;
-use crate::sampler::dsp::voice::{LfoParams, SampleVoice};
+use crate::sampler::dsp::voice::{GroupVoiceOverrides, LfoParams, SampleVoice};
 use crate::sampler::dsp::zone::Zone;
 
 #[derive(Clone)]
@@ -37,6 +38,7 @@ pub struct SamplerEngine {
     steal_mode: StealMode,
     patch: Patch,
     held_notes: Vec<(u8, u8)>,
+    held_note_flags: [bool; 128],
     last_note: u8,
     play_mode: PlayMode,
     voice_priority: VoicePriority,
@@ -68,6 +70,8 @@ pub struct SamplerEngine {
 
     note_volume: [f32; 128],
 
+    zone_trigger_counts: HashMap<usize, u32>,
+
     sustain_pedal: bool,
 
     sustained_notes: Vec<u8>,
@@ -93,6 +97,7 @@ impl SamplerEngine {
             steal_mode: StealMode::Oldest,
             patch: Patch::default(),
             held_notes: Vec::new(),
+            held_note_flags: [false; 128],
             last_note: 60,
             play_mode: PlayMode::Poly,
             voice_priority: VoicePriority::Last,
@@ -113,6 +118,7 @@ impl SamplerEngine {
             note_pressure: [0.0; 128],
             note_timbre: [0.0; 128],
             note_volume: [1.0; 128],
+            zone_trigger_counts: HashMap::new(),
             sustain_pedal: false,
             sustained_notes: Vec::new(),
             mod_wheel: 0.0,
@@ -131,6 +137,17 @@ impl SamplerEngine {
 
     pub fn set_patch(&mut self, patch: Patch) {
         self.patch = patch;
+        self.zone_trigger_counts.clear();
+        self.held_note_flags = [false; 128];
+        for part in &mut self.patch.parts {
+            part.last_keyswitch_note = None;
+            part.previous_note = None;
+            for group in &part.groups {
+                if let Some(default) = group.sw_default {
+                    part.last_keyswitch_note = Some(default);
+                }
+            }
+        }
     }
 
     pub fn patch(&self) -> &Patch {
@@ -213,6 +230,18 @@ impl SamplerEngine {
 
     pub fn set_expression(&mut self, value: f32) {
         self.expression = value.clamp(0.0, 1.0);
+    }
+
+    fn consume_zone_trigger(&mut self, key: usize, count: u32) -> bool {
+        if count == 0 {
+            return true;
+        }
+        let remaining = self.zone_trigger_counts.entry(key).or_insert(count);
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        true
     }
 
     pub fn all_sound_off(&mut self) {
@@ -413,48 +442,94 @@ impl SamplerEngine {
 
     fn is_keyswitch_note(part: &crate::sampler::dsp::part::Part, note: u8) -> bool {
         part.groups.iter().any(|g| {
-            (g.trigger_type == crate::sampler::dsp::group::TriggerType::KeyswitchLatch
-                || g.trigger_type == crate::sampler::dsp::group::TriggerType::KeyswitchMomentary)
-                && g.trigger_note == note
+            g.sw_last == Some(note)
+                || g.sw_down == Some(note)
+                || g.sw_up == Some(note)
+                || (g.sw_lolast.is_some()
+                    && g.sw_hilast.is_some()
+                    && note >= g.sw_lolast.unwrap()
+                    && note <= g.sw_hilast.unwrap())
         })
     }
 
     pub fn note_on(&mut self, note: u8, velocity: u8, channel: u8) {
         self.held_notes.push((note, channel));
+        self.held_note_flags[note as usize] = true;
         self.last_note = note;
 
-        let Some((_pi, part)) = self.patch.find_part(channel) else {
+        let part_index = if let Some((pi, _part)) = self.patch.find_part(channel) {
+            pi
+        } else {
             return;
         };
 
-        if Self::is_keyswitch_note(part, note) {
-            if let Some((_pi, part)) = self.patch.find_part_mut(channel) {
-                part.handle_keyswitch_on(note);
-            }
+        if Self::is_keyswitch_note(&self.patch.parts[part_index], note) {
+            let part = &mut self.patch.parts[part_index];
+            part.last_keyswitch_note = Some(note);
+            part.previous_note = Some(note);
             return;
         }
 
         let cc_values = self.cc_values;
         let pitch_bend_raw = (self.pitch_bend.clamp(-1.0, 1.0) * 8192.0).round() as i16;
-        let Some((gi, _group, zone)) =
-            part.find_zone(note, velocity, channel, &cc_values, pitch_bend_raw)
-        else {
-            return;
+        let (
+            gi,
+            group_play_mode,
+            group_exclusive,
+            group_gain,
+            group_pan,
+            group_portamento,
+            part_transpose,
+            part_gain,
+            part_pan,
+            zone_key,
+            zone,
+        ) = {
+            let part = &self.patch.parts[part_index];
+            let Some((gi, group, zone)) = part.find_zone(
+                note,
+                velocity,
+                channel,
+                &cc_values,
+                pitch_bend_raw,
+                &self.held_note_flags,
+            ) else {
+                self.patch.parts[part_index].previous_note = Some(note);
+                return;
+            };
+            (
+                gi,
+                group.play_mode,
+                group.exclusive_group,
+                group.gain_db + group.master_gain_db,
+                group.pan + group.master_pan,
+                group.portamento,
+                part.transpose,
+                part.gain_db,
+                part.pan,
+                zone as *const Zone as usize,
+                Arc::new(zone.clone()),
+            )
         };
-        let zone = Arc::new(zone.clone());
+        self.patch.parts[part_index].previous_note = Some(note);
         let group_index = gi;
-        let part_index = _pi;
 
-        let transposed_note = note as i16 + part.transpose as i16;
+        let mode = group_play_mode.unwrap_or(self.play_mode);
+        let exclusive = group_exclusive;
+        let portamento = group_portamento;
+
+        if !self.consume_zone_trigger(zone_key, zone.count) {
+            return;
+        }
+        let has_active_voice = self.voices.iter().any(|v| v.is_active());
+        match zone.play_mode {
+            crate::sampler::dsp::zone::SamplePlayMode::First if has_active_voice => return,
+            crate::sampler::dsp::zone::SamplePlayMode::Legato if !has_active_voice => return,
+            _ => {}
+        }
+
+        let transposed_note = note as i16 + part_transpose as i16;
         let play_note = transposed_note.clamp(0, 127) as u8;
-
-        let mode = _group.play_mode.unwrap_or(self.play_mode);
-        let exclusive = _group.exclusive_group;
-        let group_gain = _group.gain_db;
-        let group_pan = _group.pan;
-        let part_gain = part.gain_db;
-        let part_pan = part.pan;
-        let portamento = _group.portamento;
 
         let prev_increment = self
             .voices
@@ -595,10 +670,7 @@ impl SamplerEngine {
 
     pub fn note_off(&mut self, note: u8, channel: u8) {
         self.held_notes.retain(|&(n, _)| n != note);
-
-        if let Some((_pi, part)) = self.patch.find_part_mut(channel) {
-            part.handle_keyswitch_off(note);
-        }
+        self.held_note_flags[note as usize] = false;
 
         if self.sustain_pedal {
             self.sustained_notes.push(note);
@@ -628,9 +700,14 @@ impl SamplerEngine {
                     let cc_values = self.cc_values;
                     let pitch_bend_raw = (self.pitch_bend.clamp(-1.0, 1.0) * 8192.0).round() as i16;
                     let retargeted = if let Some((_, part)) = self.patch.find_part(channel) {
-                        if let Some((_gi, group, zone)) =
-                            part.find_zone(next_note, 100, channel, &cc_values, pitch_bend_raw)
-                        {
+                        if let Some((_gi, group, zone)) = part.find_zone(
+                            next_note,
+                            100,
+                            channel,
+                            &cc_values,
+                            pitch_bend_raw,
+                            &self.held_note_flags,
+                        ) {
                             let zone = Arc::new(zone.clone());
                             let portamento = group.portamento;
                             if let Some(voice) = self.voices.iter_mut().find(|v| v.is_active()) {
@@ -842,7 +919,10 @@ impl SamplerEngine {
         if args.zone.off_by != 0 {
             for voice in &mut self.voices {
                 if voice.is_active() && voice.exclusive_group == args.zone.off_by {
-                    voice.force_stop();
+                    match args.zone.off_mode {
+                        crate::sampler::dsp::zone::OffMode::Normal => voice.release(),
+                        crate::sampler::dsp::zone::OffMode::Fast => voice.force_stop(),
+                    }
                 }
             }
         }
@@ -972,6 +1052,31 @@ impl SamplerEngine {
         self.voices[index].set_lfo4_params(self.lfo_params[3]);
         self.voices[index].set_lfo5_params(self.lfo_params[4]);
         self.voices[index].set_lfo6_params(self.lfo_params[5]);
+        let group_overrides = self
+            .patch
+            .parts
+            .get(args.part_index)
+            .and_then(|part| part.groups.get(args.group_index))
+            .map(|group| GroupVoiceOverrides {
+                amp_eg: group.eg1_params,
+                filter_eg: group.eg2_params,
+                filter: group.filter_params,
+                lfo1: group.lfo1_params,
+                lfo2: group.lfo2_params,
+                lfo3: group.lfo3_params,
+                lfo4: group.lfo4_params,
+            })
+            .unwrap_or_default();
+        self.voices[index].apply_group_overrides(group_overrides);
+        if let Some(matrix) = self
+            .patch
+            .parts
+            .get(args.part_index)
+            .and_then(|part| part.groups.get(args.group_index))
+            .map(|group| group.mod_matrix.clone())
+        {
+            self.voices[index].set_group_mod_matrix(matrix);
+        }
         self.voices[index].set_global_mod_matrix(self.global_mod_matrix.clone());
         self.voices[index].set_hierarchy_gain_pan(
             params.group_gain,
@@ -987,6 +1092,20 @@ impl SamplerEngine {
             .get(args.part_index)
             .and_then(|p| p.microtuning.clone());
         self.voices[index].set_tuning(microtuning);
+        let tuning_cents = self
+            .patch
+            .parts
+            .get(args.part_index)
+            .map(|part| {
+                part.tuning
+                    + part
+                        .groups
+                        .get(args.group_index)
+                        .map(|group| group.master_tuning)
+                        .unwrap_or(0.0)
+            })
+            .unwrap_or(0.0);
+        self.voices[index].set_tuning_cents(tuning_cents);
         self.voices[index].set_mod_wheel(self.mod_wheel);
         self.voices[index].set_pressure(self.note_pressure[args.note as usize]);
         self.voices[index].set_channel_pressure(self.note_pressure[args.note as usize]);
@@ -1059,10 +1178,13 @@ impl SamplerEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::envelope::AdsrParams;
+    use crate::common::filter::FilterParams;
     use crate::sampler::dsp::group::Group;
     use crate::sampler::dsp::part::Part;
     use crate::sampler::dsp::sample::Sample;
-    use crate::sampler::dsp::zone::{CcCondition, Zone};
+    use crate::sampler::dsp::voice::LfoParams;
+    use crate::sampler::dsp::zone::{CcCondition, OffMode, SamplePlayMode, Zone};
 
     fn make_test_patch() -> Patch {
         let mut zone = Zone::default();
@@ -1393,8 +1515,6 @@ mod tests {
 
     #[test]
     fn test_keyswitch_latch() {
-        use crate::sampler::dsp::group::TriggerType;
-
         let mut patch = Patch::default();
 
         let mut zone_a = Zone::default();
@@ -1407,8 +1527,7 @@ mod tests {
         zone_a.key_high = 60;
         let mut group_a = Group::default();
         group_a.zones.push(zone_a);
-        group_a.trigger_type = TriggerType::KeyswitchLatch;
-        group_a.trigger_note = 24;
+        group_a.sw_last = Some(24);
 
         let mut zone_b = Zone::default();
         let mut sample_b = Sample::silent(48000.0);
@@ -1420,8 +1539,7 @@ mod tests {
         zone_b.key_high = 60;
         let mut group_b = Group::default();
         group_b.zones.push(zone_b);
-        group_b.trigger_type = TriggerType::KeyswitchLatch;
-        group_b.trigger_note = 25;
+        group_b.sw_last = Some(25);
 
         let mut part = Part::default();
         part.groups.push(group_a);
@@ -1451,8 +1569,6 @@ mod tests {
 
     #[test]
     fn test_keyswitch_momentary() {
-        use crate::sampler::dsp::group::TriggerType;
-
         let mut patch = Patch::default();
         let mut zone = Zone::default();
         let mut sample = Sample::silent(48000.0);
@@ -1464,8 +1580,7 @@ mod tests {
         zone.key_high = 60;
         let mut group = Group::default();
         group.zones.push(zone);
-        group.trigger_type = TriggerType::KeyswitchMomentary;
-        group.trigger_note = 24;
+        group.sw_down = Some(24);
 
         let mut part = Part::default();
         part.groups.push(group);
@@ -1486,6 +1601,130 @@ mod tests {
         engine.note_off(24, 0);
         engine.note_on(60, 100, 0);
         assert!(!engine.voices.iter().any(|v| v.is_active()));
+    }
+
+    #[test]
+    fn test_keyswitch_default() {
+        let mut patch = Patch::default();
+        let mut zone = Zone::default();
+        let mut sample = Sample::silent(48000.0);
+        sample.frames = 1000;
+        sample.data_l = vec![1.0f32; 1000];
+        sample.data_r = vec![1.0f32; 1000];
+        zone.sample = Arc::new(sample);
+        zone.key_low = 60;
+        zone.key_high = 60;
+        let mut group = Group::default();
+        group.zones.push(zone);
+        group.sw_last = Some(24);
+        group.sw_default = Some(24);
+
+        let mut part = Part::default();
+        part.groups.push(group);
+        patch.parts = vec![part];
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+
+        engine.note_on(60, 100, 0);
+        assert!(engine.voices.iter().any(|v| v.is_active()));
+    }
+
+    #[test]
+    fn test_keyswitch_up_default() {
+        let mut patch = Patch::default();
+        let mut zone = Zone::default();
+        let mut sample = Sample::silent(48000.0);
+        sample.frames = 1000;
+        sample.data_l = vec![1.0f32; 1000];
+        sample.data_r = vec![1.0f32; 1000];
+        zone.sample = Arc::new(sample);
+        zone.key_low = 60;
+        zone.key_high = 60;
+        let mut group = Group::default();
+        group.zones.push(zone);
+        group.sw_up = Some(24);
+
+        let mut part = Part::default();
+        part.groups.push(group);
+        patch.parts = vec![part];
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+
+        engine.note_on(60, 100, 0);
+        assert!(engine.voices.iter().any(|v| v.is_active()));
+        engine.all_sound_off();
+
+        engine.note_on(24, 100, 0);
+        engine.note_on(60, 100, 0);
+        assert!(!engine.voices.iter().any(|v| v.is_active()));
+        engine.all_sound_off();
+
+        engine.note_off(24, 0);
+        engine.note_on(60, 100, 0);
+        assert!(engine.voices.iter().any(|v| v.is_active()));
+    }
+
+    #[test]
+    fn test_keyswitch_previous() {
+        let mut patch = Patch::default();
+        let mut zone = Zone::default();
+        let mut sample = Sample::silent(48000.0);
+        sample.frames = 1000;
+        sample.data_l = vec![1.0f32; 1000];
+        sample.data_r = vec![1.0f32; 1000];
+        zone.sample = Arc::new(sample);
+        zone.key_low = 60;
+        zone.key_high = 60;
+        let mut group = Group::default();
+        group.zones.push(zone);
+        group.sw_previous = Some(50);
+
+        let mut part = Part::default();
+        part.groups.push(group);
+        patch.parts = vec![part];
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+
+        engine.note_on(60, 100, 0);
+        assert!(!engine.voices.iter().any(|v| v.is_active()));
+
+        engine.note_on(50, 100, 0);
+        engine.note_on(60, 100, 0);
+        assert!(engine.voices.iter().any(|v| v.is_active()));
+    }
+
+    #[test]
+    fn test_keyswitch_range() {
+        let mut patch = Patch::default();
+        let mut zone = Zone::default();
+        let mut sample = Sample::silent(48000.0);
+        sample.frames = 1000;
+        sample.data_l = vec![1.0f32; 1000];
+        sample.data_r = vec![1.0f32; 1000];
+        zone.sample = Arc::new(sample);
+        zone.key_low = 60;
+        zone.key_high = 60;
+        let mut group = Group::default();
+        group.zones.push(zone);
+        group.sw_lolast = Some(24);
+        group.sw_hilast = Some(26);
+
+        let mut part = Part::default();
+        part.groups.push(group);
+        patch.parts = vec![part];
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+
+        engine.note_on(60, 100, 0);
+        assert!(!engine.voices.iter().any(|v| v.is_active()));
+
+        engine.note_on(25, 100, 0);
+        engine.note_on(60, 100, 0);
+        assert!(engine.voices.iter().any(|v| v.is_active()));
     }
 
     #[test]
@@ -1769,6 +2008,52 @@ mod tests {
     }
 
     #[test]
+    fn test_group_filter_keytrack_and_subtype_apply_to_voice() {
+        use crate::common::filter::FilterSubtype;
+
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].filter_params = Some(FilterParams {
+            enabled: true,
+            cutoff: 1000.0,
+            key_tracking: 0.5,
+            subtype: FilterSubtype::HeavyDrive,
+            ..FilterParams::default()
+        });
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+
+        let voice = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        assert!((voice.filter_key_tracking() - 0.5).abs() < f32::EPSILON);
+        assert_eq!(voice.filter_subtype(), FilterSubtype::HeavyDrive);
+    }
+
+    #[test]
+    fn test_group_lfo_shape_phase_trigger_sync_apply_to_voice() {
+        use crate::common::lfo::{LfoShape, LfoSyncMode, LfoTriggerMode};
+
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].lfo1_params = Some(LfoParams {
+            rate: 5.0,
+            amount: 0.5,
+            enabled: true,
+            shape: LfoShape::Square,
+            phase: 0.25,
+            trigger: LfoTriggerMode::FreeRun,
+            sync_mode: LfoSyncMode::Tempo,
+            ..LfoParams::default()
+        });
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+
+        let voice = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        assert!(voice.lfo1_enabled());
+    }
+
+    #[test]
     fn test_per_note_pitch_bend_affects_only_target_voice() {
         let mut patch = Patch::default();
         let mut zone = Zone::default();
@@ -1813,6 +2098,297 @@ mod tests {
             inc_64 > 1.25 && inc_64 < 1.27,
             "note 64 should keep its natural +4 semitone increment, got {}",
             inc_64
+        );
+    }
+
+    #[test]
+    fn test_group_filter_override_applies_to_voice() {
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].filter_params = Some(FilterParams {
+            enabled: true,
+            cutoff: 1000.0,
+            ..FilterParams::default()
+        });
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+
+        let voice = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        assert!(voice.filter_enabled());
+    }
+
+    #[test]
+    fn test_group_amp_eg_override_applies_to_voice() {
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].eg1_params = Some(AdsrParams::new(0.5, 0.2, 0.8, 0.4));
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+
+        let voice = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        assert_eq!(voice.amp_eg_params(), AdsrParams::new(0.5, 0.2, 0.8, 0.4));
+    }
+
+    #[test]
+    fn test_group_lfo_override_applies_to_voice() {
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].lfo1_params = Some(LfoParams {
+            rate: 5.0,
+            amount: 0.5,
+            enabled: true,
+            ..LfoParams::default()
+        });
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+
+        let voice = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        assert!(voice.lfo1_enabled());
+    }
+
+    #[test]
+    fn test_global_filter_params_respect_group_override() {
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].filter_params = Some(FilterParams {
+            enabled: true,
+            cutoff: 1000.0,
+            ..FilterParams::default()
+        });
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+        engine.set_filter_params(FilterParams::default());
+
+        let voice = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        assert!(voice.filter_enabled());
+    }
+
+    #[test]
+    fn test_group_filter_veltrack_applies_to_voice() {
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].filter_params = Some(FilterParams {
+            enabled: true,
+            cutoff: 1000.0,
+            vel_tracking: 2400.0,
+            ..FilterParams::default()
+        });
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+
+        engine.note_on(60, 1, 0);
+        let voice_low = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        assert!((voice_low.filter_vel_tracking() - 2400.0).abs() < f32::EPSILON);
+        // The voice stores the parsed velocity-tracking value; the actual filter cutoff
+        // is computed per-sample from base cutoff * 2^(vel_tracking_cents/1200).
+    }
+
+    #[test]
+    fn test_group_cutoff_oncc_modulates_active_voice() {
+        use crate::sampler::dsp::mod_matrix::ModTarget;
+
+        let mut patch = Patch::default();
+        let mut zone = Zone::default();
+        let mut sample = Sample::silent(48000.0);
+        sample.frames = 48000;
+        sample.data_l = (0..48000).map(|i| i as f32).collect();
+        sample.data_r = sample.data_l.clone();
+        zone.sample = Arc::new(sample);
+        zone.key_low = 60;
+        zone.key_high = 60;
+        let mut group = Group::default();
+        group.zones.push(zone);
+        group.filter_params = Some(FilterParams {
+            enabled: true,
+            cutoff: 1000.0,
+            ..FilterParams::default()
+        });
+        group
+            .mod_matrix
+            .set_cc_route(0, 74, ModTarget::FilterCutoff, 1.0);
+        let mut part = Part::default();
+        part.groups.push(group);
+        patch.parts = vec![part];
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+
+        engine.note_on(60, 100, 0);
+        let mut out_quiet = vec![0.0f32; 64];
+        let mut out_r = vec![0.0f32; 64];
+        engine.process_block(&mut out_quiet, &mut out_r);
+        let peak_quiet = out_quiet.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+
+        engine.set_cc(74, 127);
+        let mut out_loud = vec![0.0f32; 64];
+        engine.process_block(&mut out_loud, &mut out_r);
+        let peak_loud = out_loud.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+
+        assert!(
+            peak_loud > peak_quiet,
+            "group cutoff_oncc should open the filter on CC change"
+        );
+    }
+
+    #[test]
+    fn test_count_limits_zone_triggers() {
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].zones[0].count = 2;
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+
+        engine.note_on(60, 100, 0);
+        assert_eq!(engine.voices.iter().filter(|v| v.is_active()).count(), 1);
+        engine.all_sound_off();
+
+        engine.note_on(60, 100, 0);
+        assert_eq!(engine.voices.iter().filter(|v| v.is_active()).count(), 1);
+        engine.all_sound_off();
+
+        engine.note_on(60, 100, 0);
+        assert_eq!(engine.voices.iter().filter(|v| v.is_active()).count(), 0);
+    }
+
+    #[test]
+    fn test_off_mode_normal_releases_choked_voice() {
+        let mut patch = Patch::default();
+        let mut sustained_zone = Zone::default();
+        sustained_zone.key_low = 60;
+        sustained_zone.key_high = 60;
+        sustained_zone.sample = Arc::new(Sample::silent(48000.0));
+        let mut choke_zone = Zone::default();
+        choke_zone.key_low = 62;
+        choke_zone.key_high = 62;
+        choke_zone.off_by = 3;
+        choke_zone.off_mode = OffMode::Normal;
+        choke_zone.sample = Arc::new(Sample::silent(48000.0));
+        let mut group_a = Group {
+            exclusive_group: 3,
+            ..Default::default()
+        };
+        group_a.zones.push(sustained_zone);
+        let mut group_b = Group::default();
+        group_b.zones.push(choke_zone);
+        let mut part = Part::default();
+        part.groups.push(group_a);
+        part.groups.push(group_b);
+        patch.parts = vec![part];
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+        assert_eq!(engine.voices.iter().filter(|v| v.is_active()).count(), 1);
+
+        engine.note_on(62, 100, 0);
+        assert!(engine.voices.iter().any(|v| v.is_active() && v.note == 60));
+    }
+
+    #[test]
+    fn test_trigger_first_ignores_subsequent_notes() {
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].zones[0].play_mode = SamplePlayMode::First;
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+
+        engine.note_on(60, 100, 0);
+        assert_eq!(engine.voices.iter().filter(|v| v.is_active()).count(), 1);
+
+        engine.note_on(60, 100, 0);
+        assert_eq!(engine.voices.iter().filter(|v| v.is_active()).count(), 1);
+    }
+
+    #[test]
+    fn test_trigger_legato_requires_active_voice() {
+        let mut patch = Patch::default();
+        let mut normal_zone = Zone::default();
+        normal_zone.key_low = 62;
+        normal_zone.key_high = 62;
+        normal_zone.sample = Arc::new(Sample::silent(48000.0));
+        let mut legato_zone = Zone::default();
+        legato_zone.key_low = 60;
+        legato_zone.key_high = 60;
+        legato_zone.play_mode = SamplePlayMode::Legato;
+        legato_zone.sample = Arc::new(Sample::silent(48000.0));
+        let mut group = Group::default();
+        group.zones.push(legato_zone);
+        group.zones.push(normal_zone);
+        let mut part = Part::default();
+        part.groups.push(group);
+        patch.parts = vec![part];
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+
+        engine.note_on(60, 100, 0);
+        assert_eq!(engine.voices.iter().filter(|v| v.is_active()).count(), 0);
+
+        engine.note_on(62, 100, 0);
+        assert_eq!(engine.voices.iter().filter(|v| v.is_active()).count(), 1);
+
+        engine.note_on(60, 100, 0);
+        assert_eq!(engine.voices.iter().filter(|v| v.is_active()).count(), 2);
+    }
+
+    #[test]
+    fn test_global_gain_applies_to_voice() {
+        let mut patch = make_test_patch();
+        patch.parts[0].gain_db = -6.0;
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+
+        let voice = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        assert!((voice.hierarchy_gain() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_global_pan_applies_to_voice() {
+        let mut patch = make_test_patch();
+        patch.parts[0].pan = 0.5;
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+
+        let voice = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        assert!((voice.hierarchy_pan() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_master_gain_applies_to_voice() {
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].master_gain_db = -6.0;
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+
+        let voice = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        assert!((voice.hierarchy_gain() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_master_tune_applies_to_voice() {
+        let mut patch = make_test_patch();
+        patch.parts[0].groups[0].master_tuning = 1200.0;
+
+        let mut engine = SamplerEngine::new(48000.0, 4);
+        engine.set_patch(patch);
+        engine.note_on(60, 100, 0);
+
+        let voice = engine.voices.iter().find(|v| v.is_active()).unwrap();
+        let inc = voice.increment();
+        // +1200 cents doubles the playback rate for note 60.
+        assert!(
+            (inc - 2.0).abs() < 0.02,
+            "expected increment ~2.0, got {inc}"
         );
     }
 }

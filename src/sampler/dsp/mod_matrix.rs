@@ -49,6 +49,71 @@ pub enum ModSource {
 }
 
 impl ModSource {
+    pub fn all_routable() -> [Self; 18] {
+        [
+            Self::Velocity,
+            Self::KeyTrack,
+            Self::PitchBend,
+            Self::ModWheel,
+            Self::Pressure,
+            Self::ChannelPressure,
+            Self::Expression,
+            Self::Lfo1,
+            Self::Lfo2,
+            Self::Lfo3,
+            Self::Lfo4,
+            Self::Eg1,
+            Self::Eg2,
+            Self::Random,
+            Self::PlaybackPosition,
+            Self::IsGated,
+            Self::IsReleased,
+            Self::MidiCc,
+        ]
+    }
+}
+
+impl std::fmt::Display for ModSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::None => "None",
+            Self::Velocity => "Velocity",
+            Self::KeyTrack => "KeyTrack",
+            Self::PitchBend => "PitchBend",
+            Self::ModWheel => "ModWheel",
+            Self::Pressure => "Pressure",
+            Self::Timbre => "Timbre",
+            Self::Lfo1 => "LFO 1",
+            Self::Lfo2 => "LFO 2",
+            Self::Lfo3 => "LFO 3",
+            Self::Lfo4 => "LFO 4",
+            Self::Lfo5 => "LFO 5",
+            Self::Lfo6 => "LFO 6",
+            Self::Eg1 => "EG 1",
+            Self::Eg2 => "EG 2",
+            Self::Eg3 => "EG 3",
+            Self::Eg4 => "EG 4",
+            Self::Eg5 => "EG 5",
+            Self::Random => "Random",
+            Self::SampleAndHold => "S&H",
+            Self::VariantFraction => "Variant",
+            Self::PlaybackPosition => "Playback",
+            Self::LoopFraction => "Loop",
+            Self::IsGated => "Gate",
+            Self::IsReleased => "Release",
+            Self::GroupAnyGated => "GroupGate",
+            Self::GroupVoiceCount => "Voices",
+            Self::ChannelPressure => "ChanPress",
+            Self::ChannelVolume => "ChanVol",
+            Self::Expression => "Expression",
+            Self::Cc10Pan => "Pan CC10",
+            Self::MidiCc => "CC",
+        };
+        write!(f, "{name}")
+    }
+}
+
+impl ModSource {
     pub fn from_u8(value: u8) -> Self {
         match value {
             1 => ModSource::Velocity,

@@ -12,6 +12,10 @@ pub enum SamplePlayMode {
     OneShot = 1,
 
     OnRelease = 2,
+
+    First = 3,
+
+    Legato = 4,
 }
 
 impl SamplePlayMode {
@@ -19,7 +23,25 @@ impl SamplePlayMode {
         match v {
             1 => SamplePlayMode::OneShot,
             2 => SamplePlayMode::OnRelease,
+            3 => SamplePlayMode::First,
+            4 => SamplePlayMode::Legato,
             _ => SamplePlayMode::Normal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OffMode {
+    #[default]
+    Fast,
+    Normal,
+}
+
+impl OffMode {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => OffMode::Normal,
+            _ => OffMode::Fast,
         }
     }
 }
@@ -230,6 +252,12 @@ pub struct Zone {
 
     pub off_by: u8,
 
+    pub off_mode: OffMode,
+
+    pub amp_veltrack: f32,
+
+    pub count: u32,
+
     pub variants: Vec<Arc<Sample>>,
 
     current_variant: AtomicUsize,
@@ -302,6 +330,9 @@ impl Clone for Zone {
             seq_position: self.seq_position,
             seq_counter: AtomicUsize::new(self.seq_counter.load(Ordering::Relaxed)),
             off_by: self.off_by,
+            off_mode: self.off_mode,
+            amp_veltrack: self.amp_veltrack,
+            count: self.count,
             variants: self.variants.clone(),
             current_variant: AtomicUsize::new(self.current_variant.load(Ordering::Relaxed)),
             last_variant: AtomicUsize::new(self.last_variant.load(Ordering::Relaxed)),
@@ -369,6 +400,9 @@ impl Default for Zone {
             seq_position: 0,
             seq_counter: AtomicUsize::new(0),
             off_by: 0,
+            off_mode: OffMode::Fast,
+            amp_veltrack: 100.0,
+            count: 0,
             variants: Vec::new(),
             current_variant: AtomicUsize::new(0),
             last_variant: AtomicUsize::new(0),
@@ -572,7 +606,8 @@ impl Zone {
         }
 
         let vel_norm = apply_curve(velocity as f32 / 127.0, self.velocity_curve);
-        amp *= vel_norm;
+        let vel_influence = (self.amp_veltrack / 100.0).clamp(-1.0, 1.0);
+        amp *= 1.0 + (vel_norm - 1.0) * vel_influence;
 
         let key_gain_db = (note as f32 - self.root_key as f32) * self.amp_keytrack_db;
         amp *= 10.0_f32.powf((self.gain_db + key_gain_db) / 20.0);
@@ -819,6 +854,33 @@ mod tests {
         assert!(
             inc_exp < inc_linear,
             "exponential key curve should reduce upper-key pitch rise"
+        );
+    }
+
+    #[test]
+    fn test_amp_veltrack_scales_velocity_sensitivity() {
+        let constant_zone = Zone {
+            sample: Arc::new(Sample::silent(48000.0)),
+            amp_veltrack: 0.0,
+            ..Default::default()
+        };
+        let amp_low = constant_zone.compute_amplitude(60, 1);
+        let amp_high = constant_zone.compute_amplitude(60, 127);
+        assert!(
+            (amp_low - amp_high).abs() < f32::EPSILON,
+            "amp_veltrack=0 should remove velocity dependence"
+        );
+
+        let tracking_zone = Zone {
+            sample: Arc::new(Sample::silent(48000.0)),
+            amp_veltrack: 100.0,
+            ..Default::default()
+        };
+        let amp_low = tracking_zone.compute_amplitude(60, 1);
+        let amp_high = tracking_zone.compute_amplitude(60, 127);
+        assert!(
+            amp_high > amp_low,
+            "amp_veltrack=100 should preserve velocity dependence"
         );
     }
 }

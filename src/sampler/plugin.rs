@@ -1074,6 +1074,8 @@ fn lfo_params(store: &ParamStore<ParamId>, index: usize) -> LfoParams {
         trigger: LfoTriggerMode::from_u8(store.get(trigger) as u8),
         unipolar: store.get(unipolar) >= 0.5,
         sync_mode: LfoSyncMode::from_u8(store.get(sync_mode) as u8),
+        delay: 0.0,
+        fade: 0.0,
     }
 }
 
@@ -1096,6 +1098,7 @@ fn filter_params(store: &ParamStore<ParamId>, ids: FilterParamIds) -> FilterPara
         resonance: store.get(ids.resonance) as f32,
         eg_amount: store.get(ids.eg_amount) as f32,
         key_tracking: store.get(ids.key_tracking) as f32,
+        vel_tracking: 0.0,
         drive: store.get(ids.drive) as f32,
         enabled: store.get(ids.enabled) >= 0.5,
     }
@@ -1160,6 +1163,9 @@ pub(crate) fn build_zones_from_patch(patch: &Patch) -> Vec<SampleZone> {
                 sample_zone.seq_length = zone.seq_length;
                 sample_zone.seq_position = zone.seq_position;
                 sample_zone.off_by = zone.off_by;
+                sample_zone.off_mode = zone.off_mode;
+                sample_zone.amp_veltrack = zone.amp_veltrack;
+                sample_zone.count = zone.count;
                 sample_zone.mod_matrix = zone.mod_matrix.clone();
                 sample_zone.extra_sfz_opcodes = zone.extra_sfz_opcodes.clone();
                 zones.push(sample_zone);
@@ -1184,6 +1190,22 @@ pub(crate) fn build_groups_from_patch(patch: &Patch) -> Vec<SampleGroup> {
                 sample_group.pan = group.pan;
                 sample_group.output = group.output;
                 sample_group.extra_sfz_opcodes = group.extra_sfz_opcodes.clone();
+                sample_group.sw_last = group.sw_last;
+                sample_group.sw_down = group.sw_down;
+                sample_group.sw_up = group.sw_up;
+                sample_group.sw_previous = group.sw_previous;
+                sample_group.sw_lolast = group.sw_lolast;
+                sample_group.sw_hilast = group.sw_hilast;
+                sample_group.sw_default = group.sw_default;
+                sample_group.sw_label = group.sw_label.clone();
+                sample_group.eg1_params = group.eg1_params;
+                sample_group.eg2_params = group.eg2_params;
+                sample_group.lfo1_params = group.lfo1_params;
+                sample_group.lfo2_params = group.lfo2_params;
+                sample_group.lfo3_params = group.lfo3_params;
+                sample_group.lfo4_params = group.lfo4_params;
+                sample_group.filter_params = group.filter_params;
+                sample_group.mod_matrix = group.mod_matrix.clone();
                 groups.push(sample_group);
             }
         }
@@ -1343,6 +1365,9 @@ fn build_dsp_zone(zone: &SampleZone, sample_rate: f32) -> Zone {
     dsp_zone.seq_length = zone.seq_length;
     dsp_zone.seq_position = zone.seq_position;
     dsp_zone.off_by = zone.off_by;
+    dsp_zone.off_mode = zone.off_mode;
+    dsp_zone.amp_veltrack = zone.amp_veltrack;
+    dsp_zone.count = zone.count;
     dsp_zone.mod_matrix = zone.mod_matrix.clone();
     dsp_zone.extra_sfz_opcodes = zone.extra_sfz_opcodes.clone();
     dsp_zone.files = zone.files.clone();
@@ -2550,6 +2575,58 @@ mod tests {
         assert_eq!(zones[1].name, "Kick Soft");
         assert_eq!(zones[1].vel_low, 0);
         assert_eq!(zones[1].vel_high, 99);
+    }
+
+    #[test]
+    fn build_groups_from_patch_preserves_group_processors_and_keyswitches() {
+        use crate::common::envelope::AdsrParams;
+        use crate::common::filter::FilterParams;
+        use crate::sampler::dsp::voice::LfoParams;
+
+        let mut group = Group {
+            name: String::from("Drums"),
+            ..Default::default()
+        };
+        group.output = 3;
+        group.sw_last = Some(60);
+        group.sw_default = Some(48);
+        group.sw_label = Some(String::from("Kit A"));
+        group.eg1_params = Some(AdsrParams {
+            attack: 0.05,
+            ..Default::default()
+        });
+        group.eg2_params = Some(AdsrParams {
+            decay: 0.2,
+            ..Default::default()
+        });
+        group.lfo1_params = Some(LfoParams {
+            rate: 2.0,
+            ..Default::default()
+        });
+        group.filter_params = Some(FilterParams {
+            cutoff: 1000.0,
+            ..Default::default()
+        });
+
+        let patch = Patch {
+            parts: vec![Part {
+                groups: vec![group],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let groups = build_groups_from_patch(&patch);
+        assert_eq!(groups.len(), 1);
+        let sample_group = &groups[0];
+        assert_eq!(sample_group.output, 3);
+        assert_eq!(sample_group.sw_last, Some(60));
+        assert_eq!(sample_group.sw_default, Some(48));
+        assert_eq!(sample_group.sw_label.as_deref(), Some("Kit A"));
+        assert_eq!(sample_group.eg1_params.map(|p| p.attack), Some(0.05));
+        assert_eq!(sample_group.eg2_params.map(|p| p.decay), Some(0.2));
+        assert_eq!(sample_group.lfo1_params.map(|p| p.rate), Some(2.0));
+        assert_eq!(sample_group.filter_params.map(|p| p.cutoff), Some(1000.0));
     }
 
     #[test]

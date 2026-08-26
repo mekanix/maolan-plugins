@@ -37,7 +37,8 @@ use symphonia::core::{
 
 use crate::{
     common::{
-        filter::FilterType,
+        envelope::AdsrParams,
+        filter::{FilterParams, FilterSubtype, FilterType},
         lfo::LfoShape,
         lfo_assignment::{LfoAssignmentConfig, LfoAssignmentState, ModRouteParamIds},
     },
@@ -49,7 +50,8 @@ use crate::{
             patch::Patch,
             sample::load_audio,
             sfz::{export_patch_to_sfz, is_non_vendor_sfz_opcode},
-            zone::{CcCondition, LoopMode, SamplePlayMode, Zone},
+            voice::LfoParams,
+            zone::{CcCondition, CurveType, LoopMode, OffMode, SamplePlayMode, Zone},
         },
         load_status::SamplerLoadStatus,
         loader::{PresetInfo, detect_format},
@@ -154,8 +156,11 @@ pub enum Message {
     ToggleEditingZoneReverse(bool),
     SetEditingZonePlayMode(ZonePlayModeOption),
     SetEditingZoneLoopMode(ZoneLoopModeOption),
+    SetEditingZoneVelocityCurve(ZoneCurveOption),
+    SetEditingZoneOffMode(ZoneOffModeOption),
     AddEditingZoneCcRoute,
     RemoveEditingZoneCcRoute(usize),
+    SetEditingZoneCcRouteSource(usize, ModSource),
     SetEditingZoneCcRouteCc(usize, f32),
     SetEditingZoneCcRouteTarget(usize, CcModTargetOption),
     SetEditingZoneCcRouteDepth(usize, f32),
@@ -166,6 +171,11 @@ pub enum Message {
     SetEditingZoneCcConditionLow(usize, f32),
     SetEditingZoneCcConditionHigh(usize, f32),
     SetSelectedGroupValue(GroupEditField, f32),
+    SetSelectedGroupParam(GroupParamField, f32),
+    SetSelectedGroupLfoShape(usize, LfoShape),
+    SetSelectedGroupFilterType(FilterType),
+    SetSelectedGroupFilterSubtype(FilterSubtype),
+    SetSelectedGroupSwLabel(String),
     SetEditingZoneExtraSfz(String),
     SetSelectedGroupExtraSfz(String),
     PianoKeyPressed(u8, u8),
@@ -214,6 +224,9 @@ pub enum ZoneEditField {
     SeqLength,
     SeqPosition,
     OffBy,
+    Output,
+    AmpVeltrack,
+    Count,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +235,38 @@ pub enum GroupEditField {
     ExclusiveGroup,
     GainDb,
     Pan,
+    Output,
+    SwLast,
+    SwDown,
+    SwUp,
+    SwPrevious,
+    SwLoLast,
+    SwHiLast,
+    SwDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupParamField {
+    Eg1Attack,
+    Eg1Decay,
+    Eg1Sustain,
+    Eg1Release,
+    Eg2Attack,
+    Eg2Decay,
+    Eg2Sustain,
+    Eg2Release,
+    Lfo1Rate,
+    Lfo1Amount,
+    Lfo2Rate,
+    Lfo2Amount,
+    Lfo3Rate,
+    Lfo3Amount,
+    Lfo4Rate,
+    Lfo4Amount,
+    FilterCutoff,
+    FilterResonance,
+    FilterKeyTrack,
+    FilterVelTrack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,17 +404,27 @@ pub enum ZonePlayModeOption {
     Attack,
     OneShot,
     Release,
+    First,
+    Legato,
 }
 
 impl ZonePlayModeOption {
-    fn all() -> [Self; 3] {
-        [Self::Attack, Self::OneShot, Self::Release]
+    fn all() -> [Self; 5] {
+        [
+            Self::Attack,
+            Self::OneShot,
+            Self::Release,
+            Self::First,
+            Self::Legato,
+        ]
     }
 
     fn from_mode(mode: SamplePlayMode) -> Self {
         match mode {
             SamplePlayMode::OneShot => Self::OneShot,
             SamplePlayMode::OnRelease => Self::Release,
+            SamplePlayMode::First => Self::First,
+            SamplePlayMode::Legato => Self::Legato,
             SamplePlayMode::Normal => Self::Attack,
         }
     }
@@ -379,6 +434,8 @@ impl ZonePlayModeOption {
             Self::Attack => SamplePlayMode::Normal,
             Self::OneShot => SamplePlayMode::OneShot,
             Self::Release => SamplePlayMode::OnRelease,
+            Self::First => SamplePlayMode::First,
+            Self::Legato => SamplePlayMode::Legato,
         }
     }
 }
@@ -389,6 +446,8 @@ impl std::fmt::Display for ZonePlayModeOption {
             Self::Attack => write!(f, "Attack"),
             Self::OneShot => write!(f, "One Shot"),
             Self::Release => write!(f, "Release"),
+            Self::First => write!(f, "First"),
+            Self::Legato => write!(f, "Legato"),
         }
     }
 }
@@ -428,6 +487,89 @@ impl std::fmt::Display for ZoneLoopModeOption {
             Self::Off => write!(f, "Off"),
             Self::Continuous => write!(f, "Continuous"),
             Self::Sustain => write!(f, "Sustain"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneCurveOption {
+    Linear,
+    Exponential,
+    Logarithmic,
+    SCurve,
+}
+
+impl ZoneCurveOption {
+    fn all() -> [Self; 4] {
+        [
+            Self::Linear,
+            Self::Exponential,
+            Self::Logarithmic,
+            Self::SCurve,
+        ]
+    }
+
+    fn from_curve(curve: CurveType) -> Self {
+        match curve {
+            CurveType::Exponential => Self::Exponential,
+            CurveType::Logarithmic => Self::Logarithmic,
+            CurveType::SCurve => Self::SCurve,
+            CurveType::Linear => Self::Linear,
+        }
+    }
+
+    fn curve(self) -> CurveType {
+        match self {
+            Self::Linear => CurveType::Linear,
+            Self::Exponential => CurveType::Exponential,
+            Self::Logarithmic => CurveType::Logarithmic,
+            Self::SCurve => CurveType::SCurve,
+        }
+    }
+}
+
+impl std::fmt::Display for ZoneCurveOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Linear => write!(f, "Linear"),
+            Self::Exponential => write!(f, "Exponential"),
+            Self::Logarithmic => write!(f, "Logarithmic"),
+            Self::SCurve => write!(f, "S-Curve"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneOffModeOption {
+    Fast,
+    Normal,
+}
+
+impl ZoneOffModeOption {
+    fn all() -> [Self; 2] {
+        [Self::Fast, Self::Normal]
+    }
+
+    fn from_mode(mode: OffMode) -> Self {
+        match mode {
+            OffMode::Normal => Self::Normal,
+            OffMode::Fast => Self::Fast,
+        }
+    }
+
+    fn mode(self) -> OffMode {
+        match self {
+            Self::Fast => OffMode::Fast,
+            Self::Normal => OffMode::Normal,
+        }
+    }
+}
+
+impl std::fmt::Display for ZoneOffModeOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fast => write!(f, "Fast"),
+            Self::Normal => write!(f, "Normal"),
         }
     }
 }
@@ -715,6 +857,9 @@ fn apply_editable_zone_metadata(zone: &mut Zone, editable: &SampleZone) {
     zone.seq_length = editable.seq_length;
     zone.seq_position = editable.seq_position;
     zone.off_by = editable.off_by;
+    zone.off_mode = editable.off_mode;
+    zone.amp_veltrack = editable.amp_veltrack;
+    zone.count = editable.count;
     zone.mod_matrix = editable.mod_matrix.clone();
     zone.extra_sfz_opcodes = editable.extra_sfz_opcodes.clone();
 }
@@ -746,6 +891,22 @@ fn export_patch_from_state(state: &State) -> Patch {
             pan: group.pan,
             output: group.output,
             extra_sfz_opcodes: group.extra_sfz_opcodes.clone(),
+            sw_last: group.sw_last,
+            sw_down: group.sw_down,
+            sw_up: group.sw_up,
+            sw_previous: group.sw_previous,
+            sw_lolast: group.sw_lolast,
+            sw_hilast: group.sw_hilast,
+            sw_default: group.sw_default,
+            sw_label: group.sw_label.clone(),
+            eg1_params: group.eg1_params,
+            eg2_params: group.eg2_params,
+            lfo1_params: group.lfo1_params,
+            lfo2_params: group.lfo2_params,
+            lfo3_params: group.lfo3_params,
+            lfo4_params: group.lfo4_params,
+            filter_params: group.filter_params,
+            mod_matrix: group.mod_matrix.clone(),
             ..Default::default()
         })
         .collect();
@@ -944,6 +1105,129 @@ fn find_vertical_slot(
 
 fn clamp_u7(value: f32) -> u8 {
     value.round().clamp(0.0, 127.0) as u8
+}
+
+fn note_option_from_slider(value: f32) -> Option<u8> {
+    let rounded = value.round() as i32;
+    if (0..=127).contains(&rounded) {
+        Some(rounded as u8)
+    } else {
+        None
+    }
+}
+
+fn slider_value_from_note_option(note: Option<u8>) -> f32 {
+    note.map(f32::from).unwrap_or(-1.0)
+}
+
+fn note_option_text(note: Option<u8>) -> String {
+    match note {
+        Some(n) => n.to_string(),
+        None => String::from("off"),
+    }
+}
+
+fn group_eg_params_mut(group: &mut SampleGroup, index: usize) -> &mut AdsrParams {
+    let params = match index {
+        2 => &mut group.eg2_params,
+        _ => &mut group.eg1_params,
+    };
+    params.get_or_insert(AdsrParams::default())
+}
+
+fn group_lfo_params_mut(group: &mut SampleGroup, index: usize) -> &mut LfoParams {
+    let params = match index {
+        1 => &mut group.lfo1_params,
+        2 => &mut group.lfo2_params,
+        3 => &mut group.lfo3_params,
+        _ => &mut group.lfo4_params,
+    };
+    params.get_or_insert(LfoParams::default())
+}
+
+fn group_filter_params_mut(group: &mut SampleGroup) -> &mut FilterParams {
+    group.filter_params.get_or_insert(FilterParams::default())
+}
+
+fn apply_group_param_field(group: &mut SampleGroup, field: GroupParamField, value: f32) {
+    match field {
+        GroupParamField::Eg1Attack => {
+            group_eg_params_mut(group, 1).attack = value.max(0.0);
+        }
+        GroupParamField::Eg1Decay => {
+            group_eg_params_mut(group, 1).decay = value.max(0.0);
+        }
+        GroupParamField::Eg1Sustain => {
+            group_eg_params_mut(group, 1).sustain = value.clamp(0.0, 1.0);
+        }
+        GroupParamField::Eg1Release => {
+            group_eg_params_mut(group, 1).release = value.max(0.0);
+        }
+        GroupParamField::Eg2Attack => {
+            group_eg_params_mut(group, 2).attack = value.max(0.0);
+        }
+        GroupParamField::Eg2Decay => {
+            group_eg_params_mut(group, 2).decay = value.max(0.0);
+        }
+        GroupParamField::Eg2Sustain => {
+            group_eg_params_mut(group, 2).sustain = value.clamp(0.0, 1.0);
+        }
+        GroupParamField::Eg2Release => {
+            group_eg_params_mut(group, 2).release = value.max(0.0);
+        }
+        GroupParamField::Lfo1Rate => {
+            let params = group_lfo_params_mut(group, 1);
+            params.rate = value.max(0.0);
+            params.enabled = true;
+        }
+        GroupParamField::Lfo1Amount => {
+            let params = group_lfo_params_mut(group, 1);
+            params.amount = value;
+            params.enabled = true;
+        }
+        GroupParamField::Lfo2Rate => {
+            let params = group_lfo_params_mut(group, 2);
+            params.rate = value.max(0.0);
+            params.enabled = true;
+        }
+        GroupParamField::Lfo2Amount => {
+            let params = group_lfo_params_mut(group, 2);
+            params.amount = value;
+            params.enabled = true;
+        }
+        GroupParamField::Lfo3Rate => {
+            let params = group_lfo_params_mut(group, 3);
+            params.rate = value.max(0.0);
+            params.enabled = true;
+        }
+        GroupParamField::Lfo3Amount => {
+            let params = group_lfo_params_mut(group, 3);
+            params.amount = value;
+            params.enabled = true;
+        }
+        GroupParamField::Lfo4Rate => {
+            let params = group_lfo_params_mut(group, 4);
+            params.rate = value.max(0.0);
+            params.enabled = true;
+        }
+        GroupParamField::Lfo4Amount => {
+            let params = group_lfo_params_mut(group, 4);
+            params.amount = value;
+            params.enabled = true;
+        }
+        GroupParamField::FilterCutoff => {
+            group_filter_params_mut(group).cutoff = value.max(20.0);
+        }
+        GroupParamField::FilterResonance => {
+            group_filter_params_mut(group).resonance = value.clamp(0.0, 1.0);
+        }
+        GroupParamField::FilterKeyTrack => {
+            group_filter_params_mut(group).key_tracking = (value / 100.0).clamp(0.0, 1.0);
+        }
+        GroupParamField::FilterVelTrack => {
+            group_filter_params_mut(group).vel_tracking = value.clamp(-9600.0, 9600.0);
+        }
+    }
 }
 
 fn set_pair_low(pair: &mut Option<(u8, u8)>, low: u8, default: (u8, u8)) {
@@ -1797,6 +2081,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             ZoneEditField::OffBy => {
                                 zone.off_by = clamp_u7(value);
                             }
+                            ZoneEditField::Output => {
+                                zone.output = value.round().clamp(0.0, 31.0) as u8;
+                                state.shared.request_audio_ports_rescan();
+                            }
+                            ZoneEditField::AmpVeltrack => {
+                                zone.amp_veltrack = value.clamp(-100.0, 100.0);
+                            }
+                            ZoneEditField::Count => {
+                                zone.count = value.max(0.0).round() as u32;
+                            }
                         }
                         state.shared.zones.store(zones);
                         state.shared.bump_zones_version();
@@ -1846,6 +2140,28 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     }
                 }
             }
+            Message::SetEditingZoneVelocityCurve(curve) => {
+                if let Some(index) = state.editing_zone_index {
+                    let mut zones = state.shared.zones.load();
+                    if let Some(zone) = Arc::make_mut(&mut zones).get_mut(index) {
+                        zone.velocity_curve = curve.curve();
+                        state.shared.zones.store(zones);
+                        state.shared.bump_zones_version();
+                        state.shared.mark_dirty();
+                    }
+                }
+            }
+            Message::SetEditingZoneOffMode(mode) => {
+                if let Some(index) = state.editing_zone_index {
+                    let mut zones = state.shared.zones.load();
+                    if let Some(zone) = Arc::make_mut(&mut zones).get_mut(index) {
+                        zone.off_mode = mode.mode();
+                        state.shared.zones.store(zones);
+                        state.shared.bump_zones_version();
+                        state.shared.mark_dirty();
+                    }
+                }
+            }
             Message::AddEditingZoneCcRoute => {
                 if let Some(index) = state.editing_zone_index {
                     let mut zones = state.shared.zones.load();
@@ -1877,6 +2193,20 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         && let Some(route) = zone.mod_matrix.routes.get_mut(route_index)
                     {
                         *route = ModRoute::default();
+                        state.shared.zones.store(zones);
+                        state.shared.bump_zones_version();
+                        state.shared.mark_dirty();
+                    }
+                }
+            }
+            Message::SetEditingZoneCcRouteSource(route_index, source) => {
+                if let Some(index) = state.editing_zone_index {
+                    let mut zones = state.shared.zones.load();
+                    if let Some(zone) = Arc::make_mut(&mut zones).get_mut(index)
+                        && let Some(route) = zone.mod_matrix.routes.get_mut(route_index)
+                    {
+                        route.source = source;
+                        route.active = route.target != ModTarget::None;
                         state.shared.zones.store(zones);
                         state.shared.bump_zones_version();
                         state.shared.mark_dirty();
@@ -2040,7 +2370,109 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             GroupEditField::Pan => {
                                 group.pan = (value / 100.0).clamp(-1.0, 1.0);
                             }
+                            GroupEditField::Output => {
+                                group.output = value.round().clamp(0.0, 31.0) as u8;
+                                state.shared.request_audio_ports_rescan();
+                            }
+                            GroupEditField::SwLast => {
+                                group.sw_last = note_option_from_slider(value);
+                            }
+                            GroupEditField::SwDown => {
+                                group.sw_down = note_option_from_slider(value);
+                            }
+                            GroupEditField::SwUp => {
+                                group.sw_up = note_option_from_slider(value);
+                            }
+                            GroupEditField::SwPrevious => {
+                                group.sw_previous = note_option_from_slider(value);
+                            }
+                            GroupEditField::SwLoLast => {
+                                group.sw_lolast = note_option_from_slider(value);
+                            }
+                            GroupEditField::SwHiLast => {
+                                group.sw_hilast = note_option_from_slider(value);
+                            }
+                            GroupEditField::SwDefault => {
+                                group.sw_default = note_option_from_slider(value);
+                            }
                         }
+                        state.shared.groups.store(groups);
+                        state.shared.bump_zones_version();
+                        state.shared.mark_dirty();
+                    }
+                }
+            }
+            Message::SetSelectedGroupParam(field, value) => {
+                if let Some(ZoneListSelection::Group(group_name)) = state.selected.as_ref() {
+                    let mut groups = state.shared.groups.load();
+                    if let Some(group) = Arc::make_mut(&mut groups)
+                        .iter_mut()
+                        .find(|group| group.name == *group_name)
+                    {
+                        apply_group_param_field(group, field, value);
+                        state.shared.groups.store(groups);
+                        state.shared.bump_zones_version();
+                        state.shared.mark_dirty();
+                    }
+                }
+            }
+            Message::SetSelectedGroupLfoShape(index, shape) => {
+                if let Some(ZoneListSelection::Group(group_name)) = state.selected.as_ref() {
+                    let mut groups = state.shared.groups.load();
+                    if let Some(group) = Arc::make_mut(&mut groups)
+                        .iter_mut()
+                        .find(|group| group.name == *group_name)
+                    {
+                        let params = group_lfo_params_mut(group, index);
+                        params.shape = shape;
+                        params.enabled = true;
+                        state.shared.groups.store(groups);
+                        state.shared.bump_zones_version();
+                        state.shared.mark_dirty();
+                    }
+                }
+            }
+            Message::SetSelectedGroupFilterType(filter_type) => {
+                if let Some(ZoneListSelection::Group(group_name)) = state.selected.as_ref() {
+                    let mut groups = state.shared.groups.load();
+                    if let Some(group) = Arc::make_mut(&mut groups)
+                        .iter_mut()
+                        .find(|group| group.name == *group_name)
+                    {
+                        let params = group.filter_params.get_or_insert(FilterParams::default());
+                        params.filter_type = filter_type;
+                        params.enabled = true;
+                        state.shared.groups.store(groups);
+                        state.shared.bump_zones_version();
+                        state.shared.mark_dirty();
+                    }
+                }
+            }
+            Message::SetSelectedGroupFilterSubtype(subtype) => {
+                if let Some(ZoneListSelection::Group(group_name)) = state.selected.as_ref() {
+                    let mut groups = state.shared.groups.load();
+                    if let Some(group) = Arc::make_mut(&mut groups)
+                        .iter_mut()
+                        .find(|group| group.name == *group_name)
+                    {
+                        let params = group.filter_params.get_or_insert(FilterParams::default());
+                        params.subtype = subtype;
+                        params.enabled = true;
+                        state.shared.groups.store(groups);
+                        state.shared.bump_zones_version();
+                        state.shared.mark_dirty();
+                    }
+                }
+            }
+            Message::SetSelectedGroupSwLabel(text) => {
+                state.extra_sfz_opcode_text = text.clone();
+                if let Some(ZoneListSelection::Group(group_name)) = state.selected.as_ref() {
+                    let mut groups = state.shared.groups.load();
+                    if let Some(group) = Arc::make_mut(&mut groups)
+                        .iter_mut()
+                        .find(|group| group.name == *group_name)
+                    {
+                        group.sw_label = if text.is_empty() { None } else { Some(text) };
                         state.shared.groups.store(groups);
                         state.shared.bump_zones_version();
                         state.shared.mark_dirty();
@@ -2318,7 +2750,7 @@ fn param_control<'a>(id: ParamId, label: &'a str, state: &'a State) -> Element<'
     }
 }
 
-fn vslider<'a>(id: ParamId, label: &'a str, state: &'a State) -> Element<'a, Message> {
+fn hslider<'a>(id: ParamId, label: &'a str, state: &'a State) -> Element<'a, Message> {
     let value = state.shared.params.get(id) as f32;
     let def = &PARAMS[id.as_index()];
     let slider = Slider::new(def.min as f32..=def.max as f32, value, move |v| {
@@ -2327,19 +2759,21 @@ fn vslider<'a>(id: ParamId, label: &'a str, state: &'a State) -> Element<'a, Mes
     .step(def.step as f32)
     .double_click_reset(def.default as f32)
     .on_release(Message::ReleaseParam(id))
-    .width(Length::Fixed(20.0))
-    .height(Length::Fixed(80.0));
+    .horizontal()
+    .width(Length::Fixed(50.0))
+    .height(Length::Fixed(14.0));
 
     container(
         column![
             text(label).size(11),
-            slider,
-            text(format!("{value:.2}")).size(10)
+            row![slider, text(format!("{value:.2}")).size(10)]
+                .spacing(4)
+                .align_y(Alignment::Center),
         ]
         .spacing(2)
         .align_x(Alignment::Center),
     )
-    .width(Length::Fixed(32.0))
+    .width(Length::Fixed(70.0))
     .padding(2)
     .into()
 }
@@ -3186,13 +3620,89 @@ fn group_slider<'a>(
     })
     .step(step)
     .width(Length::Fixed(120.0))
-    .height(Length::Fixed(20.0));
+    .height(Length::Fixed(20.0))
+    .horizontal();
 
     row![text(label).size(10), slider, text(value_text).size(9)]
         .spacing(5)
         .align_y(Alignment::Center)
         .width(Length::Fill)
         .into()
+}
+
+fn group_param_slider<'a>(
+    label: &'static str,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f32,
+    field: GroupParamField,
+    value_text: String,
+) -> Element<'a, Message> {
+    let slider = Slider::new(range, value, move |v| {
+        Message::SetSelectedGroupParam(field, v)
+    })
+    .step(step)
+    .width(Length::Fixed(120.0))
+    .height(Length::Fixed(20.0))
+    .horizontal();
+
+    row![text(label).size(10), slider, text(value_text).size(9)]
+        .spacing(5)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into()
+}
+
+fn keyswitch_slider<'a>(
+    label: &'static str,
+    value: Option<u8>,
+    field: GroupEditField,
+) -> Element<'a, Message> {
+    let slider = Slider::new(
+        -1.0..=127.0,
+        slider_value_from_note_option(value),
+        move |v| Message::SetSelectedGroupValue(field, v),
+    )
+    .step(1.0)
+    .width(Length::Fixed(120.0))
+    .height(Length::Fixed(20.0))
+    .horizontal();
+
+    row![
+        text(label).size(10),
+        slider,
+        text(note_option_text(value)).size(9)
+    ]
+    .spacing(5)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+    .into()
+}
+
+fn filter_type_options() -> [FilterType; 9] {
+    [
+        FilterType::Lowpass,
+        FilterType::Highpass,
+        FilterType::Bandpass,
+        FilterType::Notch,
+        FilterType::Peak,
+        FilterType::Allpass,
+        FilterType::LowShelf,
+        FilterType::HighShelf,
+        FilterType::Bell,
+    ]
+}
+
+fn filter_subtype_options() -> [FilterSubtype; 7] {
+    [
+        FilterSubtype::Clean,
+        FilterSubtype::MildDrive,
+        FilterSubtype::HeavyDrive,
+        FilterSubtype::Asymmetric,
+        FilterSubtype::SoftClip,
+        FilterSubtype::SineSat,
+        FilterSubtype::Ojd,
+    ]
 }
 
 fn sanitize_sfz_opcode_key(text: &str) -> String {
@@ -3270,6 +3780,306 @@ fn selected_group_controls<'a>(
                 1.0,
                 GroupEditField::Pan,
                 format!("{:.0}", group.pan * 100.0),
+            ),
+            group_slider(
+                "Output",
+                group.output as f32,
+                0.0..=31.0,
+                1.0,
+                GroupEditField::Output,
+                group.output.to_string(),
+            ),
+            text("Keyswitches")
+                .size(10)
+                .color(Color::from_rgb(0.68, 0.70, 0.76)),
+            keyswitch_slider("Last", group.sw_last, GroupEditField::SwLast),
+            keyswitch_slider("Down", group.sw_down, GroupEditField::SwDown),
+            keyswitch_slider("Up", group.sw_up, GroupEditField::SwUp),
+            keyswitch_slider("Previous", group.sw_previous, GroupEditField::SwPrevious),
+            keyswitch_slider("Lo Last", group.sw_lolast, GroupEditField::SwLoLast),
+            keyswitch_slider("Hi Last", group.sw_hilast, GroupEditField::SwHiLast),
+            keyswitch_slider("Default", group.sw_default, GroupEditField::SwDefault),
+            text_input("sw_label ...", group.sw_label.as_deref().unwrap_or(""))
+                .on_input(Message::SetSelectedGroupSwLabel)
+                .size(10)
+                .width(Length::Fill),
+            text("Amp EG")
+                .size(10)
+                .color(Color::from_rgb(0.68, 0.70, 0.76)),
+            group_param_slider(
+                "A",
+                group.eg1_params.map_or(0.01, |p| p.attack),
+                0.0..=10.0,
+                0.001,
+                GroupParamField::Eg1Attack,
+                format!("{:.3}", group.eg1_params.map_or(0.01, |p| p.attack)),
+            ),
+            group_param_slider(
+                "D",
+                group.eg1_params.map_or(0.0, |p| p.decay),
+                0.0..=10.0,
+                0.001,
+                GroupParamField::Eg1Decay,
+                format!("{:.3}", group.eg1_params.map_or(0.0, |p| p.decay)),
+            ),
+            group_param_slider(
+                "S",
+                group.eg1_params.map_or(1.0, |p| p.sustain) * 100.0,
+                0.0..=100.0,
+                1.0,
+                GroupParamField::Eg1Sustain,
+                format!("{:.0}", group.eg1_params.map_or(1.0, |p| p.sustain) * 100.0),
+            ),
+            group_param_slider(
+                "R",
+                group.eg1_params.map_or(0.05, |p| p.release),
+                0.0..=10.0,
+                0.001,
+                GroupParamField::Eg1Release,
+                format!("{:.3}", group.eg1_params.map_or(0.05, |p| p.release)),
+            ),
+            text("Filter EG")
+                .size(10)
+                .color(Color::from_rgb(0.68, 0.70, 0.76)),
+            group_param_slider(
+                "A",
+                group.eg2_params.map_or(0.01, |p| p.attack),
+                0.0..=10.0,
+                0.001,
+                GroupParamField::Eg2Attack,
+                format!("{:.3}", group.eg2_params.map_or(0.01, |p| p.attack)),
+            ),
+            group_param_slider(
+                "D",
+                group.eg2_params.map_or(0.0, |p| p.decay),
+                0.0..=10.0,
+                0.001,
+                GroupParamField::Eg2Decay,
+                format!("{:.3}", group.eg2_params.map_or(0.0, |p| p.decay)),
+            ),
+            group_param_slider(
+                "S",
+                group.eg2_params.map_or(1.0, |p| p.sustain) * 100.0,
+                0.0..=100.0,
+                1.0,
+                GroupParamField::Eg2Sustain,
+                format!("{:.0}", group.eg2_params.map_or(1.0, |p| p.sustain) * 100.0),
+            ),
+            group_param_slider(
+                "R",
+                group.eg2_params.map_or(0.05, |p| p.release),
+                0.0..=10.0,
+                0.001,
+                GroupParamField::Eg2Release,
+                format!("{:.3}", group.eg2_params.map_or(0.05, |p| p.release)),
+            ),
+            text("LFOs")
+                .size(10)
+                .color(Color::from_rgb(0.68, 0.70, 0.76)),
+            group_param_slider(
+                "Lfo1 Rate",
+                group.lfo1_params.map_or(0.0, |p| p.rate),
+                0.0..=20.0,
+                0.1,
+                GroupParamField::Lfo1Rate,
+                format!("{:.1}", group.lfo1_params.map_or(0.0, |p| p.rate)),
+            ),
+            group_param_slider(
+                "Lfo1 Amt",
+                group.lfo1_params.map_or(0.0, |p| p.amount),
+                0.0..=100.0,
+                1.0,
+                GroupParamField::Lfo1Amount,
+                format!("{:.1}", group.lfo1_params.map_or(0.0, |p| p.amount)),
+            ),
+            row![
+                text("Lfo1 Wave").size(11),
+                pick_list(
+                    LfoShape::all(),
+                    Some(group.lfo1_params.map_or(LfoShape::Sine, |p| p.shape)),
+                    |shape| Message::SetSelectedGroupLfoShape(1, shape),
+                )
+                .width(Length::Fixed(120.0)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            group_param_slider(
+                "Lfo2 Rate",
+                group.lfo2_params.map_or(0.0, |p| p.rate),
+                0.0..=20.0,
+                0.1,
+                GroupParamField::Lfo2Rate,
+                format!("{:.1}", group.lfo2_params.map_or(0.0, |p| p.rate)),
+            ),
+            group_param_slider(
+                "Lfo2 Amt",
+                group.lfo2_params.map_or(0.0, |p| p.amount),
+                0.0..=100.0,
+                1.0,
+                GroupParamField::Lfo2Amount,
+                format!("{:.1}", group.lfo2_params.map_or(0.0, |p| p.amount)),
+            ),
+            row![
+                text("Lfo2 Wave").size(11),
+                pick_list(
+                    LfoShape::all(),
+                    Some(group.lfo2_params.map_or(LfoShape::Sine, |p| p.shape)),
+                    |shape| Message::SetSelectedGroupLfoShape(2, shape),
+                )
+                .width(Length::Fixed(120.0)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            group_param_slider(
+                "Lfo3 Rate",
+                group.lfo3_params.map_or(0.0, |p| p.rate),
+                0.0..=20.0,
+                0.1,
+                GroupParamField::Lfo3Rate,
+                format!("{:.1}", group.lfo3_params.map_or(0.0, |p| p.rate)),
+            ),
+            group_param_slider(
+                "Lfo3 Amt",
+                group.lfo3_params.map_or(0.0, |p| p.amount),
+                0.0..=100.0,
+                1.0,
+                GroupParamField::Lfo3Amount,
+                format!("{:.1}", group.lfo3_params.map_or(0.0, |p| p.amount)),
+            ),
+            row![
+                text("Lfo3 Wave").size(11),
+                pick_list(
+                    LfoShape::all(),
+                    Some(group.lfo3_params.map_or(LfoShape::Sine, |p| p.shape)),
+                    |shape| Message::SetSelectedGroupLfoShape(3, shape),
+                )
+                .width(Length::Fixed(120.0)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            group_param_slider(
+                "Lfo4 Rate",
+                group.lfo4_params.map_or(0.0, |p| p.rate),
+                0.0..=20.0,
+                0.1,
+                GroupParamField::Lfo4Rate,
+                format!("{:.1}", group.lfo4_params.map_or(0.0, |p| p.rate)),
+            ),
+            group_param_slider(
+                "Lfo4 Amt",
+                group.lfo4_params.map_or(0.0, |p| p.amount),
+                0.0..=100.0,
+                1.0,
+                GroupParamField::Lfo4Amount,
+                format!("{:.1}", group.lfo4_params.map_or(0.0, |p| p.amount)),
+            ),
+            row![
+                text("Lfo4 Wave").size(11),
+                pick_list(
+                    LfoShape::all(),
+                    Some(group.lfo4_params.map_or(LfoShape::Sine, |p| p.shape)),
+                    |shape| Message::SetSelectedGroupLfoShape(4, shape),
+                )
+                .width(Length::Fixed(120.0)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text("Filter")
+                .size(10)
+                .color(Color::from_rgb(0.68, 0.70, 0.76)),
+            row![
+                text("Type").size(11),
+                pick_list(
+                    filter_type_options(),
+                    Some(
+                        group
+                            .filter_params
+                            .map_or(FilterType::Lowpass, |p| p.filter_type)
+                    ),
+                    Message::SetSelectedGroupFilterType,
+                )
+                .width(Length::Fixed(120.0)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            row![
+                text("Sub").size(11),
+                pick_list(
+                    filter_subtype_options(),
+                    Some(
+                        group
+                            .filter_params
+                            .map_or(FilterSubtype::Clean, |p| p.subtype)
+                    ),
+                    Message::SetSelectedGroupFilterSubtype,
+                )
+                .width(Length::Fixed(120.0)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            group_param_slider(
+                "Cut",
+                group
+                    .filter_params
+                    .map_or(FilterParams::default().cutoff, |p| p.cutoff),
+                20.0..=20000.0,
+                1.0,
+                GroupParamField::FilterCutoff,
+                format!(
+                    "{:.0}",
+                    group
+                        .filter_params
+                        .map_or(FilterParams::default().cutoff, |p| p.cutoff)
+                ),
+            ),
+            group_param_slider(
+                "Res",
+                group
+                    .filter_params
+                    .map_or(FilterParams::default().resonance, |p| p.resonance),
+                0.0..=1.0,
+                0.01,
+                GroupParamField::FilterResonance,
+                format!(
+                    "{:.2}",
+                    group
+                        .filter_params
+                        .map_or(FilterParams::default().resonance, |p| p.resonance)
+                ),
+            ),
+            group_param_slider(
+                "Key",
+                group
+                    .filter_params
+                    .map_or(FilterParams::default().key_tracking * 100.0, |p| p
+                        .key_tracking
+                        * 100.0),
+                0.0..=100.0,
+                1.0,
+                GroupParamField::FilterKeyTrack,
+                format!(
+                    "{:.0}",
+                    group
+                        .filter_params
+                        .map_or(FilterParams::default().key_tracking * 100.0, |p| p
+                            .key_tracking
+                            * 100.0)
+                ),
+            ),
+            group_param_slider(
+                "Vel",
+                group
+                    .filter_params
+                    .map_or(FilterParams::default().vel_tracking, |p| p.vel_tracking),
+                -9600.0..=9600.0,
+                1.0,
+                GroupParamField::FilterVelTrack,
+                format!(
+                    "{:.0}",
+                    group
+                        .filter_params
+                        .map_or(FilterParams::default().vel_tracking, |p| p.vel_tracking)
+                ),
             ),
             text("SFZ")
                 .size(10)
@@ -3800,23 +4610,45 @@ fn cc_mod_route_row<'a>(index: usize, route: &ModRoute) -> Element<'a, Message> 
     let amount = cc_mod_amount(route);
     let amount_range = cc_mod_amount_range(route.target);
     let amount_text = cc_mod_amount_text(route.target, amount);
-    let cc_slider = Slider::new(0.0..=127.0, route.source_cc as f32, move |value| {
-        Message::SetEditingZoneCcRouteCc(index, value)
-    })
-    .step(1.0)
-    .width(Length::Fixed(92.0))
-    .height(Length::Fixed(20.0));
+    let show_cc = route.source == ModSource::MidiCc;
+    let cc_slider: Element<'a, Message> = if show_cc {
+        Slider::new(0.0..=127.0, route.source_cc as f32, move |value| {
+            Message::SetEditingZoneCcRouteCc(index, value)
+        })
+        .step(1.0)
+        .width(Length::Fixed(92.0))
+        .height(Length::Fixed(20.0))
+        .horizontal()
+        .into()
+    } else {
+        container(text("").size(10))
+            .width(Length::Fixed(92.0))
+            .into()
+    };
+    let cc_text: Element<'a, Message> = if show_cc {
+        text(route.source_cc.to_string()).size(9).into()
+    } else {
+        container(text("").size(9))
+            .width(Length::Fixed(20.0))
+            .into()
+    };
     let amount_slider = Slider::new(amount_range, amount, move |value| {
         Message::SetEditingZoneCcRouteDepth(index, value)
     })
     .step(1.0)
     .width(Length::Fixed(120.0))
-    .height(Length::Fixed(20.0));
+    .height(Length::Fixed(20.0))
+    .horizontal();
 
     row![
-        text("CC").size(10),
+        pick_list(
+            ModSource::all_routable(),
+            Some(route.source),
+            move |source| { Message::SetEditingZoneCcRouteSource(index, source) },
+        )
+        .width(Length::Fixed(110.0)),
         cc_slider,
-        text(route.source_cc.to_string()).size(9),
+        cc_text,
         pick_list(CcModTargetOption::all(), target, move |target| {
             Message::SetEditingZoneCcRouteTarget(index, target)
         },)
@@ -3841,17 +4673,14 @@ fn cc_mod_routes_controls<'a>(zone: &SampleZone) -> Element<'a, Message> {
     let mut routes = column![].spacing(4).width(Length::Fill);
     let mut count = 0usize;
     for (index, route) in zone.mod_matrix.routes.iter().enumerate() {
-        if route.active
-            && route.source == ModSource::MidiCc
-            && CcModTargetOption::from_target(route.target).is_some()
-        {
+        if route.active && CcModTargetOption::from_target(route.target).is_some() {
             routes = routes.push(cc_mod_route_row(index, route));
             count += 1;
         }
     }
     if count == 0 {
         routes = routes.push(
-            text("No CC routes")
+            text("No mod routes")
                 .size(10)
                 .color(Color::from_rgb(0.58, 0.60, 0.66)),
         );
@@ -3859,7 +4688,7 @@ fn cc_mod_routes_controls<'a>(zone: &SampleZone) -> Element<'a, Message> {
 
     column![
         row![
-            text("CC Mod")
+            text("Mod Matrix")
                 .size(10)
                 .color(Color::from_rgb(0.68, 0.70, 0.76)),
             button(text("Add").size(10))
@@ -3881,19 +4710,22 @@ fn cc_condition_row<'a>(index: usize, condition: &CcCondition) -> Element<'a, Me
     })
     .step(1.0)
     .width(Length::Fixed(92.0))
-    .height(Length::Fixed(20.0));
+    .height(Length::Fixed(20.0))
+    .horizontal();
     let low_slider = Slider::new(0.0..=127.0, condition.low as f32, move |value| {
         Message::SetEditingZoneCcConditionLow(index, value)
     })
     .step(1.0)
     .width(Length::Fixed(92.0))
-    .height(Length::Fixed(20.0));
+    .height(Length::Fixed(20.0))
+    .horizontal();
     let high_slider = Slider::new(0.0..=127.0, condition.high as f32, move |value| {
         Message::SetEditingZoneCcConditionHigh(index, value)
     })
     .step(1.0)
     .width(Length::Fixed(92.0))
-    .height(Length::Fixed(20.0));
+    .height(Length::Fixed(20.0))
+    .horizontal();
 
     row![
         text("CC").size(10),
@@ -4024,6 +4856,17 @@ fn editing_zone_controls<'a>(
             ZoneEditField::KeyTracking,
             format!("{:.0}%", zone.key_tracking * 100.0),
         ),
+        row![
+            text("Vel Curve").size(11),
+            pick_list(
+                ZoneCurveOption::all(),
+                Some(ZoneCurveOption::from_curve(zone.velocity_curve)),
+                Message::SetEditingZoneVelocityCurve,
+            )
+            .width(Length::Fixed(120.0)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
     ]
     .spacing(4)
     .width(Length::Fixed(235.0));
@@ -4068,6 +4911,14 @@ fn editing_zone_controls<'a>(
             0.1,
             ZoneEditField::AmpKeytrack,
             format!("{:.1}", zone.amp_keytrack_db),
+        ),
+        zone_slider(
+            "Vel Track",
+            zone.amp_veltrack,
+            -100.0..=100.0,
+            1.0,
+            ZoneEditField::AmpVeltrack,
+            format!("{:.0}", zone.amp_veltrack),
         ),
         zone_slider(
             "Tune",
@@ -4327,6 +5178,33 @@ fn editing_zone_controls<'a>(
             ZoneEditField::OffBy,
             zone.off_by.to_string(),
         ),
+        row![
+            text("Off Mode").size(11),
+            pick_list(
+                ZoneOffModeOption::all(),
+                Some(ZoneOffModeOption::from_mode(zone.off_mode)),
+                Message::SetEditingZoneOffMode,
+            )
+            .width(Length::Fixed(120.0)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+        zone_slider(
+            "Count",
+            zone.count as f32,
+            0.0..=128.0,
+            1.0,
+            ZoneEditField::Count,
+            zone.count.to_string(),
+        ),
+        zone_slider(
+            "Output",
+            zone.output as f32,
+            0.0..=31.0,
+            1.0,
+            ZoneEditField::Output,
+            zone.output.to_string(),
+        ),
     ]
     .spacing(4)
     .width(Length::Fixed(235.0));
@@ -4499,24 +5377,24 @@ fn view(state: &State) -> Element<'_, Message> {
     };
 
     let amp_eg = panel_no_title(knob_row(vec![
-        vslider(ParamId::AmpAttack, "A", state),
-        vslider(ParamId::AmpDecay, "D", state),
-        vslider(ParamId::AmpSustain, "S", state),
-        vslider(ParamId::AmpRelease, "R", state),
+        hslider(ParamId::AmpAttack, "A", state),
+        hslider(ParamId::AmpDecay, "D", state),
+        hslider(ParamId::AmpSustain, "S", state),
+        hslider(ParamId::AmpRelease, "R", state),
     ]));
 
     let filter_eg = panel_no_title(knob_row(vec![
-        vslider(ParamId::FilterAttack, "A", state),
-        vslider(ParamId::FilterDecay, "D", state),
-        vslider(ParamId::FilterSustain, "S", state),
-        vslider(ParamId::FilterRelease, "R", state),
+        hslider(ParamId::FilterAttack, "A", state),
+        hslider(ParamId::FilterDecay, "D", state),
+        hslider(ParamId::FilterSustain, "S", state),
+        hslider(ParamId::FilterRelease, "R", state),
     ]));
 
     let pitch_eg = panel_no_title(knob_row(vec![
-        vslider(ParamId::Eg2Attack, "A", state),
-        vslider(ParamId::Eg2Decay, "D", state),
-        vslider(ParamId::Eg2Sustain, "S", state),
-        vslider(ParamId::Eg2Release, "R", state),
+        hslider(ParamId::Eg2Attack, "A", state),
+        hslider(ParamId::Eg2Decay, "D", state),
+        hslider(ParamId::Eg2Sustain, "S", state),
+        hslider(ParamId::Eg2Release, "R", state),
     ]));
 
     let selected_eg =
@@ -4529,24 +5407,24 @@ fn view(state: &State) -> Element<'_, Message> {
     .width(Length::Fixed(100.0));
 
     let eg3 = panel_no_title(knob_row(vec![
-        vslider(ParamId::Eg3Attack, "A", state),
-        vslider(ParamId::Eg3Decay, "D", state),
-        vslider(ParamId::Eg3Sustain, "S", state),
-        vslider(ParamId::Eg3Release, "R", state),
+        hslider(ParamId::Eg3Attack, "A", state),
+        hslider(ParamId::Eg3Decay, "D", state),
+        hslider(ParamId::Eg3Sustain, "S", state),
+        hslider(ParamId::Eg3Release, "R", state),
     ]));
 
     let eg4 = panel_no_title(knob_row(vec![
-        vslider(ParamId::Eg4Attack, "A", state),
-        vslider(ParamId::Eg4Decay, "D", state),
-        vslider(ParamId::Eg4Sustain, "S", state),
-        vslider(ParamId::Eg4Release, "R", state),
+        hslider(ParamId::Eg4Attack, "A", state),
+        hslider(ParamId::Eg4Decay, "D", state),
+        hslider(ParamId::Eg4Sustain, "S", state),
+        hslider(ParamId::Eg4Release, "R", state),
     ]));
 
     let eg5 = panel_no_title(knob_row(vec![
-        vslider(ParamId::Eg5Attack, "A", state),
-        vslider(ParamId::Eg5Decay, "D", state),
-        vslider(ParamId::Eg5Sustain, "S", state),
-        vslider(ParamId::Eg5Release, "R", state),
+        hslider(ParamId::Eg5Attack, "A", state),
+        hslider(ParamId::Eg5Decay, "D", state),
+        hslider(ParamId::Eg5Sustain, "S", state),
+        hslider(ParamId::Eg5Release, "R", state),
     ]));
 
     let selected_eg_panel = match state.selected_eg {

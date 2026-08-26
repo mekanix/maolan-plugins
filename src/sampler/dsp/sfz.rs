@@ -34,9 +34,9 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::common::filter::{FilterParams, FilterType};
+use crate::common::filter::{FilterParams, FilterSubtype, FilterType};
 use crate::common::lfo::{LfoShape, LfoSyncMode, LfoTriggerMode};
-use crate::sampler::dsp::group::{Group, TriggerType};
+use crate::sampler::dsp::group::Group;
 use crate::sampler::dsp::mod_matrix::{ModCurve, ModMatrix, ModSource, ModTarget};
 use crate::sampler::dsp::part::Part;
 use crate::sampler::dsp::patch::Patch;
@@ -660,6 +660,54 @@ pub fn export_patch_to_sfz(path: &Path, patch: &Patch) -> Result<(), String> {
                     format_export_float(group.pan * 100.0)
                 ));
             }
+            if group.output != 0 {
+                output.push_str(&format!(" output={}", group.output));
+            }
+            if let Some(note) = group.sw_last {
+                output.push_str(&format!(" sw_last={note}"));
+            }
+            if let Some(note) = group.sw_down {
+                output.push_str(&format!(" sw_down={note}"));
+            }
+            if let Some(note) = group.sw_up {
+                output.push_str(&format!(" sw_up={note}"));
+            }
+            if let Some(note) = group.sw_previous {
+                output.push_str(&format!(" sw_previous={note}"));
+            }
+            if let Some(note) = group.sw_lolast {
+                output.push_str(&format!(" sw_lolast={note}"));
+            }
+            if let Some(note) = group.sw_hilast {
+                output.push_str(&format!(" sw_hilast={note}"));
+            }
+            if let Some(note) = group.sw_default {
+                output.push_str(&format!(" sw_default={note}"));
+            }
+            if let Some(label) = &group.sw_label {
+                output.push_str(&format!(" sw_label={label}"));
+            }
+            if let Some(params) = group.eg1_params {
+                push_export_eg_params(&mut output, "ampeg", &params);
+            }
+            if let Some(params) = group.eg2_params {
+                push_export_eg_params(&mut output, "fileg", &params);
+            }
+            if let Some(params) = group.lfo1_params {
+                push_export_lfo_params(&mut output, 1, &params);
+            }
+            if let Some(params) = group.lfo2_params {
+                push_export_lfo_params(&mut output, 2, &params);
+            }
+            if let Some(params) = group.lfo3_params {
+                push_export_lfo_params(&mut output, 3, &params);
+            }
+            if let Some(params) = group.lfo4_params {
+                push_export_lfo_params(&mut output, 4, &params);
+            }
+            if let Some(params) = group.filter_params {
+                push_export_filter_params(&mut output, &params);
+            }
             push_extra_sfz_opcodes(&mut output, &group.extra_sfz_opcodes);
             output.push('\n');
 
@@ -728,6 +776,12 @@ fn push_export_zone_mapping(output: &mut String, zone: &Zone, export_curves: &[M
     }
     if zone.vel_high != 127 {
         output.push_str(&format!(" hivel={}", zone.vel_high));
+    }
+    if zone.velocity_curve != CurveType::Linear {
+        output.push_str(&format!(
+            " velcurve={}",
+            export_curve_type(zone.velocity_curve)
+        ));
     }
     if let Some((low, high)) = zone.key_fade_in {
         output.push_str(&format!(" xfin_lokey={low} xfin_hikey={high}"));
@@ -855,6 +909,8 @@ fn push_export_zone_mapping(output: &mut String, zone: &Zone, export_curves: &[M
         SamplePlayMode::Normal => {}
         SamplePlayMode::OneShot => output.push_str(" loop_mode=one_shot"),
         SamplePlayMode::OnRelease => output.push_str(" trigger=release"),
+        SamplePlayMode::First => output.push_str(" trigger=first"),
+        SamplePlayMode::Legato => output.push_str(" trigger=legato"),
     }
     if zone.loop_mode != LoopMode::Off && zone.play_mode != SamplePlayMode::OneShot {
         match zone.loop_mode {
@@ -895,6 +951,21 @@ fn push_export_zone_mapping(output: &mut String, zone: &Zone, export_curves: &[M
     }
     if zone.off_by != 0 {
         output.push_str(&format!(" off_by={}", zone.off_by));
+    }
+    if zone.output != 0 {
+        output.push_str(&format!(" output={}", zone.output));
+    }
+    if zone.off_mode == crate::sampler::dsp::zone::OffMode::Normal {
+        output.push_str(" off_mode=normal");
+    }
+    if (zone.amp_veltrack - 100.0).abs() > f32::EPSILON {
+        output.push_str(&format!(
+            " amp_veltrack={}",
+            format_export_float(zone.amp_veltrack)
+        ));
+    }
+    if zone.count != 0 {
+        output.push_str(&format!(" count={}", zone.count));
     }
     push_export_mod_matrix(output, &zone.mod_matrix, export_curves);
 }
@@ -1046,6 +1117,325 @@ fn format_export_float(value: f32) -> String {
     text
 }
 
+fn export_attack_shape(shape: crate::common::envelope::AttackShape) -> f32 {
+    match shape {
+        crate::common::envelope::AttackShape::Concave => -1.0,
+        crate::common::envelope::AttackShape::Linear => 0.0,
+        crate::common::envelope::AttackShape::Convex => 1.0,
+    }
+}
+
+fn export_decay_release_shape(shape: crate::common::envelope::DecayReleaseShape) -> i32 {
+    match shape {
+        crate::common::envelope::DecayReleaseShape::Linear => 0,
+        crate::common::envelope::DecayReleaseShape::Quadratic => 1,
+        crate::common::envelope::DecayReleaseShape::Cubic => 2,
+    }
+}
+
+fn export_lfo_wave(shape: crate::common::lfo::LfoShape) -> &'static str {
+    match shape {
+        crate::common::lfo::LfoShape::Sine => "sine",
+        crate::common::lfo::LfoShape::Triangle => "triangle",
+        crate::common::lfo::LfoShape::Saw => "saw",
+        crate::common::lfo::LfoShape::Ramp => "ramp",
+        crate::common::lfo::LfoShape::Square => "square",
+        crate::common::lfo::LfoShape::SampleHold => "sample&hold",
+        crate::common::lfo::LfoShape::Noise => "noise",
+        crate::common::lfo::LfoShape::Envelope => "envelope",
+        _ => "sine",
+    }
+}
+
+fn export_lfo_trigger(mode: crate::common::lfo::LfoTriggerMode) -> &'static str {
+    match mode {
+        crate::common::lfo::LfoTriggerMode::FreeRun => "free",
+        crate::common::lfo::LfoTriggerMode::KeyTrigger => "attack",
+        crate::common::lfo::LfoTriggerMode::Random => "random",
+    }
+}
+
+fn export_lfo_sync(mode: crate::common::lfo::LfoSyncMode) -> &'static str {
+    match mode {
+        crate::common::lfo::LfoSyncMode::Free => "none",
+        crate::common::lfo::LfoSyncMode::Tempo => "tempo",
+    }
+}
+
+fn export_filter_type(filter_type: crate::common::filter::FilterType) -> &'static str {
+    match filter_type {
+        crate::common::filter::FilterType::Lowpass => "lpf_2p",
+        crate::common::filter::FilterType::Highpass => "hpf_2p",
+        crate::common::filter::FilterType::Bandpass => "bpf_2p",
+        crate::common::filter::FilterType::Notch => "brf_2p",
+        crate::common::filter::FilterType::Peak => "pkf_2p",
+        crate::common::filter::FilterType::Allpass => "apf_1p",
+        crate::common::filter::FilterType::LowShelf => "lsh_1p",
+        crate::common::filter::FilterType::HighShelf => "hsh_1p",
+        crate::common::filter::FilterType::Bell => "bpk_2p",
+        _ => "lpf_2p",
+    }
+}
+
+fn push_export_eg_params(
+    output: &mut String,
+    prefix: &str,
+    params: &crate::common::envelope::AdsrParams,
+) {
+    use crate::common::envelope::AdsrParams;
+    let default = AdsrParams::default();
+    if params.attack != default.attack {
+        output.push_str(&format!(
+            " {prefix}_attack={}",
+            format_export_float(params.attack)
+        ));
+    }
+    if params.decay != default.decay {
+        output.push_str(&format!(
+            " {prefix}_decay={}",
+            format_export_float(params.decay)
+        ));
+    }
+    if params.sustain != default.sustain {
+        output.push_str(&format!(
+            " {prefix}_sustain={}",
+            format_export_float(params.sustain * 100.0)
+        ));
+    }
+    if params.release != default.release {
+        output.push_str(&format!(
+            " {prefix}_release={}",
+            format_export_float(params.release)
+        ));
+    }
+    if params.delay != default.delay {
+        output.push_str(&format!(
+            " {prefix}_delay={}",
+            format_export_float(params.delay)
+        ));
+    }
+    if params.hold != default.hold {
+        output.push_str(&format!(
+            " {prefix}_hold={}",
+            format_export_float(params.hold)
+        ));
+    }
+    if params.start != default.start {
+        output.push_str(&format!(
+            " {prefix}_start={}",
+            format_export_float(params.start * 100.0)
+        ));
+    }
+    if params.end != default.end {
+        output.push_str(&format!(
+            " {prefix}_end={}",
+            format_export_float(params.end * 100.0)
+        ));
+    }
+    if params.vel2_attack != default.vel2_attack {
+        output.push_str(&format!(
+            " {prefix}_vel2attack={}",
+            format_export_float(params.vel2_attack)
+        ));
+    }
+    if params.vel2_decay != default.vel2_decay {
+        output.push_str(&format!(
+            " {prefix}_vel2decay={}",
+            format_export_float(params.vel2_decay)
+        ));
+    }
+    if params.vel2_sustain != default.vel2_sustain {
+        output.push_str(&format!(
+            " {prefix}_vel2sustain={}",
+            format_export_float(params.vel2_sustain * 100.0)
+        ));
+    }
+    if params.vel2_release != default.vel2_release {
+        output.push_str(&format!(
+            " {prefix}_vel2release={}",
+            format_export_float(params.vel2_release)
+        ));
+    }
+    if params.vel2_delay != default.vel2_delay {
+        output.push_str(&format!(
+            " {prefix}_vel2delay={}",
+            format_export_float(params.vel2_delay)
+        ));
+    }
+    if params.vel2_hold != default.vel2_hold {
+        output.push_str(&format!(
+            " {prefix}_vel2hold={}",
+            format_export_float(params.vel2_hold)
+        ));
+    }
+    if params.vel2_start != default.vel2_start {
+        output.push_str(&format!(
+            " {prefix}_vel2start={}",
+            format_export_float(params.vel2_start * 100.0)
+        ));
+    }
+    if params.vel2_end != default.vel2_end {
+        output.push_str(&format!(
+            " {prefix}_vel2end={}",
+            format_export_float(params.vel2_end * 100.0)
+        ));
+    }
+    if params.key2_attack != default.key2_attack {
+        output.push_str(&format!(
+            " {prefix}_key2attack={}",
+            format_export_float(params.key2_attack)
+        ));
+    }
+    if params.key2_decay != default.key2_decay {
+        output.push_str(&format!(
+            " {prefix}_key2decay={}",
+            format_export_float(params.key2_decay)
+        ));
+    }
+    if params.key2_sustain != default.key2_sustain {
+        output.push_str(&format!(
+            " {prefix}_key2sustain={}",
+            format_export_float(params.key2_sustain * 100.0)
+        ));
+    }
+    if params.key2_release != default.key2_release {
+        output.push_str(&format!(
+            " {prefix}_key2release={}",
+            format_export_float(params.key2_release)
+        ));
+    }
+    if params.key2_delay != default.key2_delay {
+        output.push_str(&format!(
+            " {prefix}_key2delay={}",
+            format_export_float(params.key2_delay)
+        ));
+    }
+    if params.key2_hold != default.key2_hold {
+        output.push_str(&format!(
+            " {prefix}_key2hold={}",
+            format_export_float(params.key2_hold)
+        ));
+    }
+    if params.key2_start != default.key2_start {
+        output.push_str(&format!(
+            " {prefix}_key2start={}",
+            format_export_float(params.key2_start * 100.0)
+        ));
+    }
+    if params.key2_end != default.key2_end {
+        output.push_str(&format!(
+            " {prefix}_key2end={}",
+            format_export_float(params.key2_end * 100.0)
+        ));
+    }
+    if params.attack_shape != default.attack_shape {
+        output.push_str(&format!(
+            " {prefix}_attack_shape={}",
+            format_export_float(export_attack_shape(params.attack_shape))
+        ));
+    }
+    if params.decay_shape != default.decay_shape {
+        output.push_str(&format!(
+            " {prefix}_decay_shape={}",
+            export_decay_release_shape(params.decay_shape)
+        ));
+    }
+    if params.release_shape != default.release_shape {
+        output.push_str(&format!(
+            " {prefix}_release_shape={}",
+            export_decay_release_shape(params.release_shape)
+        ));
+    }
+}
+
+fn push_export_lfo_params(
+    output: &mut String,
+    index: usize,
+    params: &crate::sampler::dsp::voice::LfoParams,
+) {
+    let prefix = format!("lfo{index:02}");
+    if params.rate > 0.0 {
+        output.push_str(&format!(
+            " {prefix}_freq={}",
+            format_export_float(params.rate)
+        ));
+    }
+    if params.amount != 0.0 {
+        output.push_str(&format!(
+            " {prefix}_depth={}",
+            format_export_float(params.amount)
+        ));
+    }
+    if params.delay != 0.0 {
+        output.push_str(&format!(
+            " {prefix}_delay={}",
+            format_export_float(params.delay)
+        ));
+    }
+    if params.fade != 0.0 {
+        output.push_str(&format!(
+            " {prefix}_fade={}",
+            format_export_float(params.fade)
+        ));
+    }
+    if params.shape != crate::common::lfo::LfoShape::Sine {
+        output.push_str(&format!(" {prefix}_wave={}", export_lfo_wave(params.shape)));
+    }
+    if params.phase != 0.0 {
+        output.push_str(&format!(
+            " {prefix}_phase={}",
+            format_export_float(params.phase * 360.0)
+        ));
+    }
+    if params.trigger != crate::common::lfo::LfoTriggerMode::KeyTrigger {
+        output.push_str(&format!(
+            " {prefix}_trigger={}",
+            export_lfo_trigger(params.trigger)
+        ));
+    }
+    if params.sync_mode != crate::common::lfo::LfoSyncMode::Free {
+        output.push_str(&format!(
+            " {prefix}_sync={}",
+            export_lfo_sync(params.sync_mode)
+        ));
+    }
+}
+
+fn push_export_filter_params(output: &mut String, params: &crate::common::filter::FilterParams) {
+    use crate::common::filter::FilterParams;
+    let default = FilterParams::default();
+    if params.cutoff != default.cutoff {
+        output.push_str(&format!(" cutoff={}", format_export_float(params.cutoff)));
+    }
+    if params.resonance != default.resonance {
+        output.push_str(&format!(
+            " resonance={}",
+            format_export_float(params.resonance)
+        ));
+    }
+    if params.filter_type != default.filter_type {
+        output.push_str(&format!(
+            " fil_type={}",
+            export_filter_type(params.filter_type)
+        ));
+    }
+    if params.key_tracking != default.key_tracking {
+        output.push_str(&format!(
+            " fil_keytrack={}",
+            format_export_float(params.key_tracking * 100.0)
+        ));
+    }
+    if params.vel_tracking != default.vel_tracking {
+        output.push_str(&format!(
+            " fil_veltrack={}",
+            format_export_float(params.vel_tracking)
+        ));
+    }
+    if params.subtype != default.subtype {
+        output.push_str(&format!(" fil_subtype={}", params.subtype as u8));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -1077,6 +1467,9 @@ fn parse_sfz_text(text: &str, base_dir: &Path) -> Result<Patch, SfzError> {
     let mut master_opcodes: OpcodeMap = OpcodeMap::default();
     let mut current_group: Option<Group> = None;
     let mut curves: HashMap<i32, ModCurve> = HashMap::new();
+    let mut current_master_gain_db: f32 = 0.0;
+    let mut current_master_pan: f32 = 0.0;
+    let mut current_master_tuning: f32 = 0.0;
 
     let mut i = 0;
     while i < tokens.len() {
@@ -1090,12 +1483,39 @@ fn parse_sfz_text(text: &str, base_dir: &Path) -> Result<Patch, SfzError> {
 
                 match name.as_str() {
                     "global" => {
+                        let mut header_opcodes = header_opcodes;
+                        if let Some(db) = get_float(&header_opcodes, "global_volume") {
+                            part.gain_db = db;
+                        }
+                        if let Some(p) = get_float(&header_opcodes, "global_pan") {
+                            part.pan = p.clamp(-100.0, 100.0) / 100.0;
+                        }
+                        if let Some(t) = get_float(&header_opcodes, "global_tune") {
+                            part.tuning = t;
+                        }
+                        header_opcodes.remove("global_volume");
+                        header_opcodes.remove("global_pan");
+                        header_opcodes.remove("global_tune");
                         global_opcodes = header_opcodes;
                         group_opcodes = OpcodeMap::default();
                         master_opcodes = OpcodeMap::default();
+                        current_master_gain_db = 0.0;
+                        current_master_pan = 0.0;
+                        current_master_tuning = 0.0;
                         current_group = None;
                     }
                     "master" => {
+                        let mut header_opcodes = header_opcodes;
+                        current_master_gain_db =
+                            get_float(&header_opcodes, "master_volume").unwrap_or(0.0);
+                        current_master_pan = get_float(&header_opcodes, "master_pan")
+                            .map(|p| p.clamp(-100.0, 100.0) / 100.0)
+                            .unwrap_or(0.0);
+                        current_master_tuning =
+                            get_float(&header_opcodes, "master_tune").unwrap_or(0.0);
+                        header_opcodes.remove("master_volume");
+                        header_opcodes.remove("master_pan");
+                        header_opcodes.remove("master_tune");
                         master_opcodes = header_opcodes;
                         // Master affects groups/regions below until another master.
                     }
@@ -1106,7 +1526,13 @@ fn parse_sfz_text(text: &str, base_dir: &Path) -> Result<Patch, SfzError> {
                         group_opcodes = combine_maps(&control_opcodes, &global_opcodes);
                         group_opcodes = combine_maps(&group_opcodes, &master_opcodes);
                         group_opcodes.extend(&header_opcodes);
-                        current_group = Some(build_group(&group_opcodes));
+                        current_group = Some(build_group(
+                            &group_opcodes,
+                            current_master_gain_db,
+                            current_master_pan,
+                            current_master_tuning,
+                            &curves,
+                        ));
                     }
                     "region" => {
                         let mut region_opcodes = group_opcodes.clone();
@@ -1185,6 +1611,10 @@ impl OpcodeMap {
     fn extend(&mut self, other: &Self) {
         self.map
             .extend(other.map.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
+    fn remove(&mut self, key: &str) -> Option<String> {
+        self.map.remove(key)
     }
 
     fn extra_opcodes(&self, handled: &[&str]) -> Vec<(String, String)> {
@@ -1277,7 +1707,11 @@ const GROUP_HANDLED_OPCODES: &[&str] = &[
     "sw_last",
     "sw_down",
     "sw_up",
+    "sw_previous",
+    "sw_lolast",
+    "sw_hilast",
     "sw_default",
+    "sw_label",
     "polyphony",
     "group",
     "group_volume",
@@ -1286,29 +1720,94 @@ const GROUP_HANDLED_OPCODES: &[&str] = &[
     "ampeg_decay",
     "ampeg_sustain",
     "ampeg_release",
+    "ampeg_delay",
+    "ampeg_hold",
+    "ampeg_start",
+    "ampeg_end",
+    "ampeg_vel2attack",
+    "ampeg_vel2decay",
+    "ampeg_vel2sustain",
+    "ampeg_vel2release",
+    "ampeg_vel2delay",
+    "ampeg_vel2hold",
+    "ampeg_vel2start",
+    "ampeg_vel2end",
+    "ampeg_key2attack",
+    "ampeg_key2decay",
+    "ampeg_key2sustain",
+    "ampeg_key2release",
+    "ampeg_key2delay",
+    "ampeg_key2hold",
+    "ampeg_key2start",
+    "ampeg_key2end",
+    "ampeg_attack_shape",
+    "ampeg_decay_shape",
+    "ampeg_release_shape",
     "fileg_attack",
     "fileg_decay",
     "fileg_sustain",
     "fileg_release",
+    "fileg_delay",
+    "fileg_hold",
+    "fileg_start",
+    "fileg_end",
+    "fileg_vel2attack",
+    "fileg_vel2decay",
+    "fileg_vel2sustain",
+    "fileg_vel2release",
+    "fileg_vel2delay",
+    "fileg_vel2hold",
+    "fileg_vel2start",
+    "fileg_vel2end",
+    "fileg_key2attack",
+    "fileg_key2decay",
+    "fileg_key2sustain",
+    "fileg_key2release",
+    "fileg_key2delay",
+    "fileg_key2hold",
+    "fileg_key2start",
+    "fileg_key2end",
+    "fileg_attack_shape",
+    "fileg_decay_shape",
+    "fileg_release_shape",
     "amplfo_freq",
     "amplfo_depth",
     "amplfo_delay",
     "amplfo_fade",
+    "amplfo_wave",
+    "amplfo_phase",
+    "amplfo_trigger",
+    "amplfo_sync",
     "fillfo_freq",
     "fillfo_depth",
     "fillfo_delay",
     "fillfo_fade",
+    "fillfo_wave",
+    "fillfo_phase",
+    "fillfo_trigger",
+    "fillfo_sync",
     "pitchlfo_freq",
     "pitchlfo_depth",
     "pitchlfo_delay",
     "pitchlfo_fade",
+    "pitchlfo_wave",
+    "pitchlfo_phase",
+    "pitchlfo_trigger",
+    "pitchlfo_sync",
     "lfo01_freq",
     "lfo01_depth",
     "lfo01_delay",
     "lfo01_fade",
+    "lfo01_wave",
+    "lfo01_phase",
+    "lfo01_trigger",
+    "lfo01_sync",
     "cutoff",
     "resonance",
     "fil_type",
+    "fil_keytrack",
+    "fil_veltrack",
+    "fil_subtype",
 ];
 
 const ZONE_HANDLED_OPCODES: &[&str] = &[
@@ -1502,23 +2001,28 @@ fn build_mod_curve(opcodes: &OpcodeMap) -> Option<(i32, ModCurve)> {
 // Group builder
 // ---------------------------------------------------------------------------
 
-fn build_group(opcodes: &OpcodeMap) -> Group {
-    let mut group = Group::default();
+fn build_group(
+    opcodes: &OpcodeMap,
+    master_gain_db: f32,
+    master_pan: f32,
+    master_tuning: f32,
+    curves: &HashMap<i32, ModCurve>,
+) -> Group {
+    let mut group = Group {
+        master_gain_db,
+        master_pan,
+        master_tuning,
+        ..Default::default()
+    };
 
-    if let Some(note) = get_note(opcodes, "sw_last") {
-        group.trigger_type = TriggerType::KeyswitchLatch;
-        group.trigger_note = note;
-    } else if let Some(note) = get_note(opcodes, "sw_down") {
-        group.trigger_type = TriggerType::KeyswitchMomentary;
-        group.trigger_note = note;
-    } else if let Some(note) = get_note(opcodes, "sw_up") {
-        group.trigger_type = TriggerType::KeyswitchMomentary;
-        group.trigger_note = note;
-    }
-
-    if get_bool(opcodes, "sw_default").unwrap_or(false) {
-        group.trigger_active = true;
-    }
+    group.sw_last = get_note(opcodes, "sw_last");
+    group.sw_down = get_note(opcodes, "sw_down");
+    group.sw_up = get_note(opcodes, "sw_up");
+    group.sw_previous = get_note(opcodes, "sw_previous");
+    group.sw_lolast = get_note(opcodes, "sw_lolast");
+    group.sw_hilast = get_note(opcodes, "sw_hilast");
+    group.sw_default = get_note(opcodes, "sw_default");
+    group.sw_label = opcodes.get("sw_label").map(|s| s.to_string());
 
     if let Some(p) = get_int(opcodes, "polyphony") {
         group.poly_limit = p.max(0) as usize;
@@ -1540,13 +2044,21 @@ fn build_group(opcodes: &OpcodeMap) -> Group {
 
     // SFZ amp/filter/pitch EGs and LFOs are mapped to the group's processors.
     group.eg1 = parse_amp_eg(opcodes);
+    group.eg1_params = eg_params_if_defined(opcodes, "ampeg");
     group.eg2 = parse_filter_eg(opcodes);
+    group.eg2_params = eg_params_if_defined(opcodes, "fileg");
     group.lfo1 = parse_amplfo(opcodes);
+    group.lfo1_params = lfo_params_if_defined(opcodes, "amplfo");
     group.lfo2 = parse_fillfo(opcodes);
+    group.lfo2_params = lfo_params_if_defined(opcodes, "fillfo");
     group.lfo3 = parse_pitchlfo(opcodes);
+    group.lfo3_params = lfo_params_if_defined(opcodes, "pitchlfo");
     group.lfo4 = parse_mod_lfo(opcodes);
+    group.lfo4_params = lfo_params_if_defined(opcodes, "lfo01");
 
     group.processor_chain = build_filter_chain(opcodes);
+    group.filter_params = filter_params_if_defined(opcodes);
+    group.mod_matrix = build_zone_mod_matrix(opcodes, curves);
     group.extra_sfz_opcodes = opcodes.extra_opcodes(GROUP_HANDLED_OPCODES);
 
     group
@@ -1554,88 +2066,165 @@ fn build_group(opcodes: &OpcodeMap) -> Group {
 
 fn parse_amp_eg(opcodes: &OpcodeMap) -> crate::common::envelope::AdsrEnvelope {
     let mut eg = crate::common::envelope::AdsrEnvelope::new(48000.0);
-    eg.set_params(
-        sfz_time_seconds(opcodes, "ampeg_attack").unwrap_or(0.001),
-        sfz_time_seconds(opcodes, "ampeg_decay").unwrap_or(0.0),
-        sfz_percent(opcodes, "ampeg_sustain").unwrap_or(1.0),
-        sfz_time_seconds(opcodes, "ampeg_release").unwrap_or(0.05),
-    );
+    eg.set_extended_params(parse_eg_params(opcodes, "ampeg"));
     eg
 }
 
 fn parse_filter_eg(opcodes: &OpcodeMap) -> crate::common::envelope::AdsrEnvelope {
     let mut eg = crate::common::envelope::AdsrEnvelope::new(48000.0);
-    eg.set_params(
-        sfz_time_seconds(opcodes, "fileg_attack").unwrap_or(0.001),
-        sfz_time_seconds(opcodes, "fileg_decay").unwrap_or(0.0),
-        sfz_percent(opcodes, "fileg_sustain").unwrap_or(1.0),
-        sfz_time_seconds(opcodes, "fileg_release").unwrap_or(0.05),
-    );
+    eg.set_extended_params(parse_eg_params(opcodes, "fileg"));
     eg
 }
 
+fn parse_eg_params(opcodes: &OpcodeMap, prefix: &str) -> crate::common::envelope::AdsrParams {
+    let mut params = crate::common::envelope::AdsrParams::default();
+    params.attack = sfz_time_seconds(opcodes, &format!("{prefix}_attack")).unwrap_or(0.001);
+    params.decay = sfz_time_seconds(opcodes, &format!("{prefix}_decay")).unwrap_or(0.0);
+    params.sustain = sfz_percent(opcodes, &format!("{prefix}_sustain")).unwrap_or(1.0);
+    params.release = sfz_time_seconds(opcodes, &format!("{prefix}_release")).unwrap_or(0.05);
+    params.delay = sfz_time_seconds(opcodes, &format!("{prefix}_delay")).unwrap_or(0.0);
+    params.hold = sfz_time_seconds(opcodes, &format!("{prefix}_hold")).unwrap_or(0.0);
+    params.start = sfz_percent(opcodes, &format!("{prefix}_start")).unwrap_or(0.0);
+    params.end = sfz_percent(opcodes, &format!("{prefix}_end")).unwrap_or(0.0);
+
+    params.vel2_attack = sfz_time_seconds(opcodes, &format!("{prefix}_vel2attack")).unwrap_or(0.0);
+    params.vel2_decay = sfz_time_seconds(opcodes, &format!("{prefix}_vel2decay")).unwrap_or(0.0);
+    params.vel2_sustain = sfz_percent(opcodes, &format!("{prefix}_vel2sustain")).unwrap_or(0.0);
+    params.vel2_release =
+        sfz_time_seconds(opcodes, &format!("{prefix}_vel2release")).unwrap_or(0.0);
+    params.vel2_delay = sfz_time_seconds(opcodes, &format!("{prefix}_vel2delay")).unwrap_or(0.0);
+    params.vel2_hold = sfz_time_seconds(opcodes, &format!("{prefix}_vel2hold")).unwrap_or(0.0);
+    params.vel2_start = sfz_percent(opcodes, &format!("{prefix}_vel2start")).unwrap_or(0.0);
+    params.vel2_end = sfz_percent(opcodes, &format!("{prefix}_vel2end")).unwrap_or(0.0);
+
+    params.key2_attack = sfz_time_seconds(opcodes, &format!("{prefix}_key2attack")).unwrap_or(0.0);
+    params.key2_decay = sfz_time_seconds(opcodes, &format!("{prefix}_key2decay")).unwrap_or(0.0);
+    params.key2_sustain = sfz_percent(opcodes, &format!("{prefix}_key2sustain")).unwrap_or(0.0);
+    params.key2_release =
+        sfz_time_seconds(opcodes, &format!("{prefix}_key2release")).unwrap_or(0.0);
+    params.key2_delay = sfz_time_seconds(opcodes, &format!("{prefix}_key2delay")).unwrap_or(0.0);
+    params.key2_hold = sfz_time_seconds(opcodes, &format!("{prefix}_key2hold")).unwrap_or(0.0);
+    params.key2_start = sfz_percent(opcodes, &format!("{prefix}_key2start")).unwrap_or(0.0);
+    params.key2_end = sfz_percent(opcodes, &format!("{prefix}_key2end")).unwrap_or(0.0);
+
+    params.attack_shape = opcodes
+        .get(&format!("{prefix}_attack_shape"))
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(parse_attack_shape)
+        .unwrap_or(params.attack_shape);
+    params.decay_shape = opcodes
+        .get(&format!("{prefix}_decay_shape"))
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(parse_decay_release_shape)
+        .unwrap_or(params.decay_shape);
+    params.release_shape = opcodes
+        .get(&format!("{prefix}_release_shape"))
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(parse_decay_release_shape)
+        .unwrap_or(params.release_shape);
+
+    params
+}
+
+fn parse_attack_shape(value: f32) -> crate::common::envelope::AttackShape {
+    use crate::common::envelope::AttackShape;
+    if value < -0.01 {
+        AttackShape::Concave
+    } else if value > 0.01 {
+        AttackShape::Convex
+    } else {
+        AttackShape::Linear
+    }
+}
+
+fn parse_decay_release_shape(value: f32) -> crate::common::envelope::DecayReleaseShape {
+    use crate::common::envelope::DecayReleaseShape;
+    match value.round() as i32 {
+        1 => DecayReleaseShape::Quadratic,
+        2 => DecayReleaseShape::Cubic,
+        _ => DecayReleaseShape::Linear,
+    }
+}
+
 fn parse_amplfo(opcodes: &OpcodeMap) -> crate::common::lfo::Lfo {
-    let params = lfo_params_from_opcodes(
-        opcodes,
-        "amplfo_freq",
-        "amplfo_depth",
-        "amplfo_delay",
-        "amplfo_fade",
-    );
+    let params = lfo_params_from_opcodes(opcodes, "amplfo");
     lfo_from_params(&params, 48000.0)
 }
 
 fn parse_fillfo(opcodes: &OpcodeMap) -> crate::common::lfo::Lfo {
-    let params = lfo_params_from_opcodes(
-        opcodes,
-        "fillfo_freq",
-        "fillfo_depth",
-        "fillfo_delay",
-        "fillfo_fade",
-    );
+    let params = lfo_params_from_opcodes(opcodes, "fillfo");
     lfo_from_params(&params, 48000.0)
 }
 
 fn parse_pitchlfo(opcodes: &OpcodeMap) -> crate::common::lfo::Lfo {
-    let params = lfo_params_from_opcodes(
-        opcodes,
-        "pitchlfo_freq",
-        "pitchlfo_depth",
-        "pitchlfo_delay",
-        "pitchlfo_fade",
-    );
+    let params = lfo_params_from_opcodes(opcodes, "pitchlfo");
     lfo_from_params(&params, 48000.0)
 }
 
 fn parse_mod_lfo(opcodes: &OpcodeMap) -> crate::common::lfo::Lfo {
     // Generic mod LFO used by `lfoN_*` opcodes if present.
-    let params = lfo_params_from_opcodes(
-        opcodes,
-        "lfo01_freq",
-        "lfo01_depth",
-        "lfo01_delay",
-        "lfo01_fade",
-    );
+    let params = lfo_params_from_opcodes(opcodes, "lfo01");
     lfo_from_params(&params, 48000.0)
 }
 
-fn lfo_params_from_opcodes(
-    opcodes: &OpcodeMap,
-    freq_key: &str,
-    depth_key: &str,
-    _delay_key: &str,
-    _fade_key: &str,
-) -> SamplerLfoParams {
+fn lfo_params_from_opcodes(opcodes: &OpcodeMap, prefix: &str) -> SamplerLfoParams {
+    let freq_key = format!("{prefix}_freq");
+    let depth_key = format!("{prefix}_depth");
     SamplerLfoParams {
-        rate: get_float(opcodes, freq_key).unwrap_or(0.0),
-        amount: get_float(opcodes, depth_key).unwrap_or(0.0),
-        shape: LfoShape::Sine,
-        enabled: get_float(opcodes, freq_key).is_some() || get_float(opcodes, depth_key).is_some(),
+        rate: get_float(opcodes, &freq_key).unwrap_or(0.0),
+        amount: get_float(opcodes, &depth_key).unwrap_or(0.0),
+        shape: opcodes
+            .get(&format!("{prefix}_wave"))
+            .map(parse_lfo_wave)
+            .unwrap_or(LfoShape::Sine),
+        enabled: get_float(opcodes, &freq_key).is_some()
+            || get_float(opcodes, &depth_key).is_some(),
         deform: 0.0,
-        phase: 0.0,
-        trigger: LfoTriggerMode::KeyTrigger,
+        phase: opcodes
+            .get(&format!("{prefix}_phase"))
+            .and_then(|v| v.parse::<f32>().ok())
+            .map(|degrees| (degrees / 360.0).clamp(0.0, 1.0))
+            .unwrap_or(0.0),
+        trigger: opcodes
+            .get(&format!("{prefix}_trigger"))
+            .map(parse_lfo_trigger)
+            .unwrap_or(LfoTriggerMode::KeyTrigger),
         unipolar: false,
-        sync_mode: LfoSyncMode::Free,
+        sync_mode: opcodes
+            .get(&format!("{prefix}_sync"))
+            .map(parse_lfo_sync)
+            .unwrap_or(LfoSyncMode::Free),
+        delay: sfz_time_seconds(opcodes, &format!("{prefix}_delay")).unwrap_or(0.0),
+        fade: sfz_time_seconds(opcodes, &format!("{prefix}_fade")).unwrap_or(0.0),
+    }
+}
+
+fn parse_lfo_wave(value: &str) -> LfoShape {
+    match value.to_lowercase().as_str() {
+        "sine" => LfoShape::Sine,
+        "triangle" => LfoShape::Triangle,
+        "saw" | "sawtooth" => LfoShape::Saw,
+        "ramp" => LfoShape::Ramp,
+        "square" => LfoShape::Square,
+        "sample_hold" | "sample&hold" | "random" => LfoShape::SampleHold,
+        "noise" => LfoShape::Noise,
+        "envelope" => LfoShape::Envelope,
+        _ => LfoShape::Sine,
+    }
+}
+
+fn parse_lfo_trigger(value: &str) -> LfoTriggerMode {
+    match value.to_lowercase().as_str() {
+        "free" => LfoTriggerMode::FreeRun,
+        "random" => LfoTriggerMode::Random,
+        _ => LfoTriggerMode::KeyTrigger,
+    }
+}
+
+fn parse_lfo_sync(value: &str) -> LfoSyncMode {
+    match value.to_lowercase().as_str() {
+        "tempo" | "host" => LfoSyncMode::Tempo,
+        _ => LfoSyncMode::Free,
     }
 }
 
@@ -1644,7 +2233,9 @@ fn lfo_from_params(params: &SamplerLfoParams, sample_rate: f32) -> crate::common
     lfo.set_rate_hz(params.rate.max(0.001));
     lfo.set_amount(params.amount);
     lfo.set_shape(params.shape);
+    lfo.set_start_phase(params.phase);
     lfo.set_trigger_mode(params.trigger);
+    lfo.set_sync_mode(params.sync_mode);
     lfo
 }
 
@@ -1692,6 +2283,96 @@ fn parse_filter_type(value: &str) -> FilterType {
         "bpk_2p" => FilterType::Bell,
         _ => FilterType::Lowpass,
     }
+}
+
+fn filter_params_if_defined(opcodes: &OpcodeMap) -> Option<FilterParams> {
+    let mut params = FilterParams::default();
+    let mut defined = false;
+    if let Some(c) = sfz_hertz(opcodes, "cutoff") {
+        params.cutoff = c;
+        params.enabled = true;
+        defined = true;
+    }
+    if let Some(res) = get_float(opcodes, "resonance") {
+        params.resonance = res;
+        defined = true;
+    }
+    if let Some(typ) = opcodes.get("fil_type") {
+        params.filter_type = parse_filter_type(typ);
+        params.enabled = true;
+        defined = true;
+    }
+    if let Some(kt) = get_float(opcodes, "fil_keytrack") {
+        params.key_tracking = (kt / 100.0).clamp(0.0, 1.0);
+        defined = true;
+    }
+    if let Some(vt) = get_float(opcodes, "fil_veltrack") {
+        params.vel_tracking = vt.clamp(-9600.0, 9600.0);
+        defined = true;
+    }
+    if let Some(sub) = opcodes.get("fil_subtype") {
+        if let Ok(v) = sub.parse::<u8>() {
+            params.subtype = FilterSubtype::from_u8(v);
+        }
+        defined = true;
+    }
+    defined.then_some(params)
+}
+
+fn eg_params_if_defined(
+    opcodes: &OpcodeMap,
+    prefix: &str,
+) -> Option<crate::common::envelope::AdsrParams> {
+    let keys: Vec<String> = vec![
+        format!("{prefix}_attack"),
+        format!("{prefix}_decay"),
+        format!("{prefix}_sustain"),
+        format!("{prefix}_release"),
+        format!("{prefix}_delay"),
+        format!("{prefix}_hold"),
+        format!("{prefix}_start"),
+        format!("{prefix}_end"),
+        format!("{prefix}_vel2attack"),
+        format!("{prefix}_vel2decay"),
+        format!("{prefix}_vel2sustain"),
+        format!("{prefix}_vel2release"),
+        format!("{prefix}_vel2delay"),
+        format!("{prefix}_vel2hold"),
+        format!("{prefix}_vel2start"),
+        format!("{prefix}_vel2end"),
+        format!("{prefix}_key2attack"),
+        format!("{prefix}_key2decay"),
+        format!("{prefix}_key2sustain"),
+        format!("{prefix}_key2release"),
+        format!("{prefix}_key2delay"),
+        format!("{prefix}_key2hold"),
+        format!("{prefix}_key2start"),
+        format!("{prefix}_key2end"),
+        format!("{prefix}_attack_shape"),
+        format!("{prefix}_decay_shape"),
+        format!("{prefix}_release_shape"),
+    ];
+    if keys.iter().all(|key| opcodes.get(key).is_none()) {
+        return None;
+    }
+    Some(parse_eg_params(opcodes, prefix))
+}
+
+fn lfo_params_if_defined(opcodes: &OpcodeMap, prefix: &str) -> Option<SamplerLfoParams> {
+    let keys: Vec<String> = vec![
+        format!("{prefix}_freq"),
+        format!("{prefix}_depth"),
+        format!("{prefix}_delay"),
+        format!("{prefix}_fade"),
+        format!("{prefix}_wave"),
+        format!("{prefix}_phase"),
+        format!("{prefix}_trigger"),
+        format!("{prefix}_sync"),
+    ];
+    if keys.iter().all(|key| opcodes.get(key).is_none()) {
+        return None;
+    }
+    Some(lfo_params_from_opcodes(opcodes, prefix))
 }
 
 fn sfz_time_seconds(opcodes: &OpcodeMap, key: &str) -> Option<f32> {
@@ -1871,7 +2552,7 @@ fn build_zone(
         zone.amp_keytrack_db = db;
     }
     if let Some(v) = get_float(opcodes, "amp_veltrack") {
-        let _ = v;
+        zone.amp_veltrack = v.clamp(-100.0, 100.0);
     }
 
     // Playback.
@@ -1891,7 +2572,7 @@ fn build_zone(
         zone.delay_random = delay_random.max(0.0);
     }
     if let Some(count) = get_int(opcodes, "count") {
-        let _ = count;
+        zone.count = count.max(0) as u32;
     }
     if let Some(dir) = opcodes.get("direction")
         && dir.eq_ignore_ascii_case("reverse")
@@ -1959,6 +2640,13 @@ fn build_zone(
     if let Some(v) = get_int(opcodes, "off_by") {
         zone.off_by = v.clamp(0, 255) as u8;
     }
+    if let Some(mode) = opcodes.get("off_mode") {
+        zone.off_mode = if mode.eq_ignore_ascii_case("normal") {
+            crate::sampler::dsp::zone::OffMode::Normal
+        } else {
+            crate::sampler::dsp::zone::OffMode::Fast
+        };
+    }
 
     // Mod matrix (CC modulations and velocity/key tracks).
     zone.mod_matrix = build_zone_mod_matrix(opcodes, curves);
@@ -1978,10 +2666,20 @@ fn parse_curve_type(value: &str) -> CurveType {
     }
 }
 
+fn export_curve_type(curve: CurveType) -> &'static str {
+    match curve {
+        CurveType::Linear => "linear",
+        CurveType::Exponential => "exponential",
+        CurveType::Logarithmic => "logarithmic",
+        CurveType::SCurve => "s-curve",
+    }
+}
+
 fn parse_trigger_mode(value: &str) -> SamplePlayMode {
     match value.to_lowercase().as_str() {
         "release" | "release_key" => SamplePlayMode::OnRelease,
-        "first" | "legato" => SamplePlayMode::Normal,
+        "first" => SamplePlayMode::First,
+        "legato" => SamplePlayMode::Legato,
         "attack" => SamplePlayMode::Normal,
         _ => SamplePlayMode::Normal,
     }
@@ -2007,21 +2705,6 @@ fn parse_loop_direction(value: &str) -> LoopDirection {
 fn build_zone_mod_matrix(opcodes: &OpcodeMap, curves: &HashMap<i32, ModCurve>) -> ModMatrix {
     let mut matrix = ModMatrix::default();
     let mut route = 0;
-
-    // Velocity -> amplitude is implicit in Zone::compute_amplitude, but we also
-    // support explicit `amp_veltrack` here as a fallback.
-    if let Some(depth) = get_float(opcodes, "amp_veltrack")
-        && depth != 0.0
-        && route < 16
-    {
-        matrix.set_route(
-            route,
-            ModSource::Velocity,
-            ModTarget::Amplitude,
-            (depth / 100.0).clamp(-1.0, 1.0),
-        );
-        route += 1;
-    }
 
     // Key track -> pitch is implicit in Zone::compute_increment, but
     // `pitch_keytrack=0` disables it above.
@@ -2128,6 +2811,8 @@ fn add_cc_mod_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::envelope::AdsrParams;
+    use crate::sampler::dsp::zone::{OffMode, SamplePlayMode};
 
     #[test]
     fn test_tokenize_basic() {
@@ -2206,6 +2891,51 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_global_and_master_opcodes() {
+        let text = r#"
+<global> global_volume=-3 global_pan=-50 global_tune=100
+<master> master_volume=-3 master_pan=50 master_tune=-100
+<group>
+<region> sample=silent.wav key=60
+<master> master_volume=-6
+<group>
+<region> sample=silent.wav key=61
+"#;
+        let patch = parse_sfz_text(text, Path::new("/tmp")).unwrap();
+        assert_eq!(patch.parts.len(), 1);
+        let part = &patch.parts[0];
+        assert!((part.gain_db - -3.0).abs() < f32::EPSILON);
+        assert!((part.pan - -0.5).abs() < f32::EPSILON);
+        assert!((part.tuning - 100.0).abs() < f32::EPSILON);
+
+        assert_eq!(part.groups.len(), 2);
+        let group_a = &part.groups[0];
+        assert!((group_a.master_gain_db - -3.0).abs() < f32::EPSILON);
+        assert!((group_a.master_pan - 0.5).abs() < f32::EPSILON);
+        assert!((group_a.master_tuning - -100.0).abs() < f32::EPSILON);
+
+        let group_b = &part.groups[1];
+        assert!((group_b.master_gain_db - -6.0).abs() < f32::EPSILON);
+        assert!((group_b.master_pan - 0.0).abs() < f32::EPSILON);
+        assert!((group_b.master_tuning - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_global_resets_master_state() {
+        let text = r#"
+<master> master_volume=-6
+<global> global_volume=-2
+<group>
+<region> sample=silent.wav key=60
+"#;
+        let patch = parse_sfz_text(text, Path::new("/tmp")).unwrap();
+        let part = &patch.parts[0];
+        assert!((part.gain_db - -2.0).abs() < f32::EPSILON);
+        let group = &part.groups[0];
+        assert!((group.master_gain_db - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn test_parse_sfz_silence_samples() {
         let text = r#"
 <group>
@@ -2264,24 +2994,29 @@ mod tests {
     #[test]
     fn test_parse_sfz_keyswitches() {
         let text = r#"
-<group> sw_last=24 polyphony=4
+<group> sw_last=24 sw_label=Sustain polyphony=4
 <region> sample=silent.wav key=60
-<group> sw_down=25 sw_default=1
+<group> sw_down=25 sw_default=25 sw_previous=50
 <region> sample=silent.wav key=62 bend_up=1200 bend_down=1200 keytracking=50
+<group> sw_lolast=36 sw_hilast=38
+<region> sample=silent.wav key=64
 "#;
         let patch = parse_sfz_text(text, Path::new("/tmp")).unwrap();
-        assert_eq!(patch.parts[0].groups.len(), 2);
+        assert_eq!(patch.parts[0].groups.len(), 3);
 
         let group_a = &patch.parts[0].groups[0];
-        assert_eq!(group_a.trigger_type, TriggerType::KeyswitchLatch);
-        assert_eq!(group_a.trigger_note, 24);
+        assert_eq!(group_a.sw_last, Some(24));
+        assert_eq!(group_a.sw_label.as_deref(), Some("Sustain"));
         assert_eq!(group_a.poly_limit, 4);
-        assert!(!group_a.trigger_active);
 
         let group_b = &patch.parts[0].groups[1];
-        assert_eq!(group_b.trigger_type, TriggerType::KeyswitchMomentary);
-        assert_eq!(group_b.trigger_note, 25);
-        assert!(group_b.trigger_active);
+        assert_eq!(group_b.sw_down, Some(25));
+        assert_eq!(group_b.sw_default, Some(25));
+        assert_eq!(group_b.sw_previous, Some(50));
+
+        let group_c = &patch.parts[0].groups[2];
+        assert_eq!(group_c.sw_lolast, Some(36));
+        assert_eq!(group_c.sw_hilast, Some(38));
 
         let zone_b = &group_b.zones[0];
         assert_eq!(zone_b.pitch_bend_up, 1200.0);
@@ -2571,9 +3306,7 @@ mod tests {
         assert_eq!(zone.loop_count, 3);
         assert_eq!(zone.loop_direction, LoopDirection::Alternate);
         assert_eq!(zone.variant_mode, VariantMode::RoundRobin);
-        assert_eq!(zone.mod_matrix.routes[0].source, ModSource::Velocity);
-        assert_eq!(zone.mod_matrix.routes[0].target, ModTarget::Amplitude);
-        assert!((zone.mod_matrix.routes[0].depth - 0.25).abs() < f32::EPSILON);
+        assert_eq!(zone.amp_veltrack, 25.0);
     }
 
     #[test]
@@ -2813,6 +3546,171 @@ mod tests {
         assert!(text.contains(" off_by=9"));
         assert!(!text.contains("script="));
         assert!(!text.contains("hint_region="));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_parse_group_filter_eg_lfo_params() {
+        use crate::common::lfo::{LfoShape, LfoSyncMode, LfoTriggerMode};
+
+        let text = r#"
+<group> ampeg_attack=0.5 ampeg_decay=0.2 ampeg_sustain=80 ampeg_release=0.4 \
+        fileg_attack=0.1 fileg_decay=0.3 cutoff=1000 resonance=5 \
+        fil_keytrack=50 fil_subtype=2 \
+        amplfo_freq=5 amplfo_depth=50 amplfo_wave=square amplfo_phase=90 amplfo_trigger=free amplfo_sync=tempo \
+        fillfo_freq=2 pitchlfo_freq=3 lfo01_freq=4 lfo01_wave=saw
+<region> sample=silent.wav key=60
+"#;
+        let patch = parse_sfz_text(text, Path::new("/tmp")).unwrap();
+        let group = &patch.parts[0].groups[0];
+        assert_eq!(group.eg1_params, Some(AdsrParams::new(0.5, 0.2, 0.8, 0.4)));
+        assert_eq!(group.eg2_params, Some(AdsrParams::new(0.1, 0.3, 1.0, 0.05)));
+        assert!(group.filter_params.is_some());
+        let filter = group.filter_params.unwrap();
+        assert!((filter.key_tracking - 0.5).abs() < f32::EPSILON);
+        assert_eq!(filter.subtype, FilterSubtype::HeavyDrive);
+
+        let lfo1 = group.lfo1_params.unwrap();
+        assert_eq!(lfo1.shape, LfoShape::Square);
+        assert!((lfo1.phase - 0.25).abs() < f32::EPSILON);
+        assert_eq!(lfo1.trigger, LfoTriggerMode::FreeRun);
+        assert_eq!(lfo1.sync_mode, LfoSyncMode::Tempo);
+
+        let lfo4 = group.lfo4_params.unwrap();
+        assert_eq!(lfo4.shape, LfoShape::Saw);
+    }
+
+    #[test]
+    fn test_parse_zone_count_off_mode_trigger_first_legato() {
+        let text = r#"
+<region> sample=silent.wav key=60 count=3 off_mode=normal trigger=first
+<region> sample=silent.wav key=62 count=2 off_mode=fast trigger=legato
+"#;
+        let patch = parse_sfz_text(text, Path::new("/tmp")).unwrap();
+        let zones = &patch.parts[0].groups[0].zones;
+        assert_eq!(zones[0].count, 3);
+        assert_eq!(zones[0].off_mode, OffMode::Normal);
+        assert_eq!(zones[0].play_mode, SamplePlayMode::First);
+        assert_eq!(zones[1].count, 2);
+        assert_eq!(zones[1].off_mode, OffMode::Fast);
+        assert_eq!(zones[1].play_mode, SamplePlayMode::Legato);
+    }
+
+    #[test]
+    fn test_parse_group_extended_eg_lfo_filter_params() {
+        use crate::common::envelope::{AttackShape, DecayReleaseShape};
+        use crate::common::lfo::LfoShape;
+
+        let text = r#"
+<group> ampeg_delay=0.01 ampeg_hold=0.02 ampeg_start=10 ampeg_end=20 \
+        ampeg_vel2attack=0.05 ampeg_key2sustain=5 \
+        ampeg_attack_shape=-1 ampeg_decay_shape=1 ampeg_release_shape=2 \
+        amplfo_delay=0.005 amplfo_fade=0.01 \
+        fil_veltrack=2400 cutoff_oncc74=600
+<region> sample=silent.wav key=60
+"#;
+        let patch = parse_sfz_text(text, Path::new("/tmp")).unwrap();
+        let group = &patch.parts[0].groups[0];
+
+        let eg1 = group.eg1_params.unwrap();
+        assert!((eg1.delay - 0.01).abs() < f32::EPSILON);
+        assert!((eg1.hold - 0.02).abs() < f32::EPSILON);
+        assert!((eg1.start - 0.1).abs() < f32::EPSILON);
+        assert!((eg1.end - 0.2).abs() < f32::EPSILON);
+        assert!((eg1.vel2_attack - 0.05).abs() < f32::EPSILON);
+        assert!((eg1.key2_sustain - 0.05).abs() < f32::EPSILON);
+        assert_eq!(eg1.attack_shape, AttackShape::Concave);
+        assert_eq!(eg1.decay_shape, DecayReleaseShape::Quadratic);
+        assert_eq!(eg1.release_shape, DecayReleaseShape::Cubic);
+
+        let lfo1 = group.lfo1_params.unwrap();
+        assert!((lfo1.delay - 0.005).abs() < f32::EPSILON);
+        assert!((lfo1.fade - 0.01).abs() < f32::EPSILON);
+        assert_eq!(lfo1.shape, LfoShape::Sine);
+
+        let filter = group.filter_params.unwrap();
+        assert!((filter.vel_tracking - 2400.0).abs() < f32::EPSILON);
+
+        assert!(
+            group
+                .mod_matrix
+                .routes
+                .iter()
+                .any(|route| { route.active && route.source_cc == 74 && route.depth > 0.0 })
+        );
+    }
+
+    #[test]
+    fn test_export_group_output_keyswitches_and_processors() {
+        use crate::common::envelope::AdsrParams;
+        use crate::common::filter::FilterParams;
+        use crate::sampler::dsp::voice::LfoParams;
+
+        let dir = std::env::temp_dir().join(format!(
+            "maolan_sfz_group_export_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kit.sfz");
+
+        let mut zone = Zone::default();
+        zone.name = String::from("kick");
+        zone.key_low = 36;
+        zone.key_high = 36;
+        zone.root_key = 36;
+        zone.output = 2;
+        zone.velocity_curve = CurveType::Exponential;
+        let mut group = Group {
+            name: String::from("Drums"),
+            output: 3,
+            sw_last: Some(60),
+            sw_default: Some(48),
+            sw_label: Some(String::from("Kit A")),
+            eg1_params: Some(AdsrParams {
+                attack: 0.05,
+                sustain: 0.8,
+                ..Default::default()
+            }),
+            eg2_params: Some(AdsrParams {
+                attack: 0.02,
+                ..Default::default()
+            }),
+            lfo1_params: Some(LfoParams {
+                rate: 2.0,
+                shape: LfoShape::Saw,
+                ..Default::default()
+            }),
+            filter_params: Some(FilterParams {
+                cutoff: 1000.0,
+                resonance: 0.5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        group.zones.push(zone);
+        let patch = Patch {
+            parts: vec![Part {
+                groups: vec![group],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        export_patch_to_sfz(&path, &patch).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(" output=3"));
+        assert!(text.contains(" sw_last=60"));
+        assert!(text.contains(" sw_default=48"));
+        assert!(text.contains(" sw_label=Kit A"));
+        assert!(text.contains(" ampeg_attack=0.05"));
+        assert!(text.contains(" ampeg_sustain=80"));
+        assert!(text.contains(" fileg_attack=0.02"));
+        assert!(text.contains(" lfo01_freq=2"));
+        assert!(text.contains(" lfo01_wave=saw"));
+        assert!(text.contains(" cutoff=1000"));
+        assert!(text.contains(" resonance=0.5"));
+        assert!(text.contains(" velcurve=exponential"));
+        assert!(text.contains(" output=2"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

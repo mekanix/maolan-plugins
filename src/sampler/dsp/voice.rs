@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use crate::common::envelope::{AdsrEnvelope, EnvelopeMode, EnvelopeRetriggerMode};
-use crate::common::filter::{FilterParams, SvfFilter};
+use serde::{Deserialize, Serialize};
+
+use crate::common::envelope::{AdsrEnvelope, AdsrParams, EnvelopeMode, EnvelopeRetriggerMode};
+use crate::common::filter::{FilterParams, FilterSubtype, SvfFilter};
 use crate::common::lfo::{Lfo, LfoShape, LfoSyncMode, LfoTriggerMode};
 use crate::sampler::dsp::mod_matrix::{ModMatrix, ModTarget, SourceValues};
 use crate::sampler::dsp::sample::InterpolationMode;
@@ -11,7 +13,7 @@ const PHASE_FRAC_BITS: u32 = 32;
 const PHASE_ONE: u64 = 1u64 << PHASE_FRAC_BITS;
 const PHASE_ONE_F: f64 = PHASE_ONE as f64;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct LfoParams {
     pub rate: f32,
     pub amount: f32,
@@ -22,6 +24,8 @@ pub struct LfoParams {
     pub trigger: LfoTriggerMode,
     pub unipolar: bool,
     pub sync_mode: LfoSyncMode,
+    pub delay: f32,
+    pub fade: f32,
 }
 
 impl Default for LfoParams {
@@ -36,8 +40,24 @@ impl Default for LfoParams {
             trigger: LfoTriggerMode::KeyTrigger,
             unipolar: false,
             sync_mode: LfoSyncMode::Free,
+            delay: 0.0,
+            fade: 0.0,
         }
     }
+}
+
+/// Per-voice overrides coming from SFZ group-level opcodes. When an override is
+/// present for a given module, global parameter updates from the plugin GUI are
+/// ignored for that voice so the SFZ instrument definition is preserved.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GroupVoiceOverrides {
+    pub amp_eg: Option<AdsrParams>,
+    pub filter_eg: Option<AdsrParams>,
+    pub filter: Option<FilterParams>,
+    pub lfo1: Option<LfoParams>,
+    pub lfo2: Option<LfoParams>,
+    pub lfo3: Option<LfoParams>,
+    pub lfo4: Option<LfoParams>,
 }
 
 #[inline]
@@ -145,7 +165,12 @@ pub struct SampleVoice {
     filter2_eg_amount: f32,
 
     filter_key_tracking: f32,
+    filter_vel_tracking: f32,
     filter2_key_tracking: f32,
+    filter2_vel_tracking: f32,
+
+    base_amp_eg_params: Option<AdsrParams>,
+    base_filter_eg_params: Option<AdsrParams>,
 
     mod_wheel: f32,
 
@@ -189,7 +214,13 @@ pub struct SampleVoice {
 
     tuning: Option<crate::common::tuning::Tuning>,
 
+    tuning_cents: f32,
+
     global_mod_matrix: ModMatrix,
+
+    group_mod_matrix: ModMatrix,
+
+    group_overrides: Option<GroupVoiceOverrides>,
 
     oversample: bool,
 }
@@ -253,7 +284,11 @@ impl SampleVoice {
             filter_eg_amount: 0.0,
             filter2_eg_amount: 0.0,
             filter_key_tracking: 0.0,
+            filter_vel_tracking: 0.0,
             filter2_key_tracking: 0.0,
+            filter2_vel_tracking: 0.0,
+            base_amp_eg_params: None,
+            base_filter_eg_params: None,
             mod_wheel: 0.0,
             pressure: 0.0,
             channel_pressure: 0.0,
@@ -275,7 +310,10 @@ impl SampleVoice {
             part_index: 0,
             output_bus: 0,
             tuning: None,
+            tuning_cents: 0.0,
             global_mod_matrix: ModMatrix::default(),
+            group_mod_matrix: ModMatrix::default(),
+            group_overrides: None,
             oversample: false,
         }
     }
@@ -322,12 +360,17 @@ impl SampleVoice {
         (self.pan_l, self.pan_r) = crate::common::gain_pan::pan_gains(pan);
 
         match zone.play_mode {
-            SamplePlayMode::Normal | SamplePlayMode::OneShot => {
+            SamplePlayMode::Normal
+            | SamplePlayMode::OneShot
+            | SamplePlayMode::First
+            | SamplePlayMode::Legato => {
                 if let Some(sample) = forced_sample {
                     self.start_playback_with_sample(zone, note, sample);
                 } else {
                     self.start_playback(zone, note);
                 }
+                self.recompute_aeg_params();
+                self.recompute_feg_params();
                 self.aeg.trigger();
                 self.eg2.trigger();
                 self.eg3.trigger();
@@ -388,11 +431,12 @@ impl SampleVoice {
             self.active = false;
             return;
         }
-        let semitones = if self.pitch_bend_norm >= 0.0 {
-            self.pitch_bend_norm * self.pitch_bend_up
-        } else {
-            -self.pitch_bend_norm * self.pitch_bend_down
-        };
+        let semitones = self.tuning_cents / 100.0
+            + if self.pitch_bend_norm >= 0.0 {
+                self.pitch_bend_norm * self.pitch_bend_up
+            } else {
+                -self.pitch_bend_norm * self.pitch_bend_down
+            };
         let inc = if let Some(ref tuning) = self.tuning {
             zone.compute_increment_with_tuning(note, self.sample_rate, semitones, tuning)
         } else {
@@ -461,11 +505,12 @@ impl SampleVoice {
 
     pub fn set_pitch_bend(&mut self, bend: f32) {
         self.pitch_bend_norm = bend.clamp(-1.0, 1.0);
-        let semitones = if self.pitch_bend_norm >= 0.0 {
-            self.pitch_bend_norm * self.pitch_bend_up
-        } else {
-            -self.pitch_bend_norm * self.pitch_bend_down
-        };
+        let semitones = self.tuning_cents / 100.0
+            + if self.pitch_bend_norm >= 0.0 {
+                self.pitch_bend_norm * self.pitch_bend_up
+            } else {
+                -self.pitch_bend_norm * self.pitch_bend_down
+            };
         if let Some(zone) = self.zone.as_ref() {
             let inc = zone.compute_increment_with_bend(self.note, self.sample_rate, semitones);
             self.increment = f64_to_fixed(if self.reverse { -inc } else { inc });
@@ -555,8 +600,27 @@ impl SampleVoice {
         fixed_to_f64(self.increment)
     }
 
+    fn apply_aeg_params(&mut self, params: AdsrParams) {
+        self.base_amp_eg_params = Some(params);
+        self.recompute_aeg_params();
+    }
+
+    fn recompute_aeg_params(&mut self) {
+        if let Some(params) = self.base_amp_eg_params {
+            self.aeg
+                .set_extended_params(params.scaled_for_voice(self.note, self.velocity));
+        }
+    }
+
     pub fn set_aeg_params(&mut self, attack: f32, decay: f32, sustain: f32, release: f32) {
-        self.aeg.set_params(attack, decay, sustain, release);
+        if self
+            .group_overrides
+            .as_ref()
+            .is_some_and(|o| o.amp_eg.is_some())
+        {
+            return;
+        }
+        self.apply_aeg_params(AdsrParams::new(attack, decay, sustain, release));
     }
 
     pub fn set_aeg_mode(&mut self, mode: EnvelopeMode) {
@@ -571,7 +635,7 @@ impl SampleVoice {
         self.interpolation = mode;
     }
 
-    pub fn set_filter_params(&mut self, params: FilterParams) {
+    fn apply_filter_params(&mut self, params: FilterParams) {
         self.filter_enabled = params.enabled;
         self.filter.filter_type = params.filter_type;
         self.filter.subtype = params.subtype;
@@ -580,9 +644,21 @@ impl SampleVoice {
         self.filter_resonance = params.resonance;
         self.filter_eg_amount = params.eg_amount;
         self.filter_key_tracking = params.key_tracking.clamp(0.0, 1.0);
+        self.filter_vel_tracking = params.vel_tracking;
     }
 
-    pub fn set_filter2_params(&mut self, params: FilterParams) {
+    pub fn set_filter_params(&mut self, params: FilterParams) {
+        if self
+            .group_overrides
+            .as_ref()
+            .is_some_and(|o| o.filter.is_some())
+        {
+            return;
+        }
+        self.apply_filter_params(params);
+    }
+
+    fn apply_filter2_params(&mut self, params: FilterParams) {
         self.filter2_enabled = params.enabled;
         self.filter2.filter_type = params.filter_type;
         self.filter2.subtype = params.subtype;
@@ -591,10 +667,34 @@ impl SampleVoice {
         self.filter2_resonance = params.resonance;
         self.filter2_eg_amount = params.eg_amount;
         self.filter2_key_tracking = params.key_tracking.clamp(0.0, 1.0);
+        self.filter2_vel_tracking = params.vel_tracking;
+    }
+
+    pub fn set_filter2_params(&mut self, params: FilterParams) {
+        self.apply_filter2_params(params);
+    }
+
+    fn apply_feg_params(&mut self, params: AdsrParams) {
+        self.base_filter_eg_params = Some(params);
+        self.recompute_feg_params();
+    }
+
+    fn recompute_feg_params(&mut self) {
+        if let Some(params) = self.base_filter_eg_params {
+            self.feg
+                .set_extended_params(params.scaled_for_voice(self.note, self.velocity));
+        }
     }
 
     pub fn set_feg_params(&mut self, attack: f32, decay: f32, sustain: f32, release: f32) {
-        self.feg.set_params(attack, decay, sustain, release);
+        if self
+            .group_overrides
+            .as_ref()
+            .is_some_and(|o| o.filter_eg.is_some())
+        {
+            return;
+        }
+        self.apply_feg_params(AdsrParams::new(attack, decay, sustain, release));
     }
 
     pub fn set_feg_mode(&mut self, mode: EnvelopeMode) {
@@ -602,6 +702,13 @@ impl SampleVoice {
     }
 
     pub fn set_filter_eg_amount(&mut self, amount: f32) {
+        if self
+            .group_overrides
+            .as_ref()
+            .is_some_and(|o| o.filter.is_some())
+        {
+            return;
+        }
         self.filter_eg_amount = amount;
     }
 
@@ -671,9 +778,18 @@ impl SampleVoice {
         lfo.set_trigger_mode(params.trigger);
         lfo.set_unipolar(params.unipolar);
         lfo.set_sync_mode(params.sync_mode);
+        lfo.set_lfo_delay(params.delay);
+        lfo.set_lfo_fade(params.fade);
     }
 
     pub fn set_lfo1_params(&mut self, params: LfoParams) {
+        if self
+            .group_overrides
+            .as_ref()
+            .is_some_and(|o| o.lfo1.is_some())
+        {
+            return;
+        }
         Self::apply_lfo_params(
             &mut self.lfo1,
             &mut self.lfo1_amount,
@@ -683,6 +799,13 @@ impl SampleVoice {
     }
 
     pub fn set_lfo2_params(&mut self, params: LfoParams) {
+        if self
+            .group_overrides
+            .as_ref()
+            .is_some_and(|o| o.lfo2.is_some())
+        {
+            return;
+        }
         Self::apply_lfo_params(
             &mut self.lfo2,
             &mut self.lfo2_amount,
@@ -692,6 +815,13 @@ impl SampleVoice {
     }
 
     pub fn set_lfo3_params(&mut self, params: LfoParams) {
+        if self
+            .group_overrides
+            .as_ref()
+            .is_some_and(|o| o.lfo3.is_some())
+        {
+            return;
+        }
         Self::apply_lfo_params(
             &mut self.lfo3,
             &mut self.lfo3_amount,
@@ -701,6 +831,13 @@ impl SampleVoice {
     }
 
     pub fn set_lfo4_params(&mut self, params: LfoParams) {
+        if self
+            .group_overrides
+            .as_ref()
+            .is_some_and(|o| o.lfo4.is_some())
+        {
+            return;
+        }
         Self::apply_lfo_params(
             &mut self.lfo4,
             &mut self.lfo4_amount,
@@ -727,8 +864,89 @@ impl SampleVoice {
         );
     }
 
+    pub fn apply_group_overrides(&mut self, overrides: GroupVoiceOverrides) {
+        if let Some(params) = overrides.amp_eg {
+            self.apply_aeg_params(params);
+        }
+        if let Some(params) = overrides.filter_eg {
+            self.apply_feg_params(params);
+        }
+        if let Some(params) = overrides.filter {
+            self.apply_filter_params(params);
+        }
+        if let Some(params) = overrides.lfo1 {
+            Self::apply_lfo_params(
+                &mut self.lfo1,
+                &mut self.lfo1_amount,
+                &mut self.lfo1_enabled,
+                params,
+            );
+        }
+        if let Some(params) = overrides.lfo2 {
+            Self::apply_lfo_params(
+                &mut self.lfo2,
+                &mut self.lfo2_amount,
+                &mut self.lfo2_enabled,
+                params,
+            );
+        }
+        if let Some(params) = overrides.lfo3 {
+            Self::apply_lfo_params(
+                &mut self.lfo3,
+                &mut self.lfo3_amount,
+                &mut self.lfo3_enabled,
+                params,
+            );
+        }
+        if let Some(params) = overrides.lfo4 {
+            Self::apply_lfo_params(
+                &mut self.lfo4,
+                &mut self.lfo4_amount,
+                &mut self.lfo4_enabled,
+                params,
+            );
+        }
+        self.group_overrides = Some(overrides);
+    }
+
+    pub fn clear_group_overrides(&mut self) {
+        self.group_overrides = None;
+    }
+
+    pub fn filter_enabled(&self) -> bool {
+        self.filter_enabled
+    }
+
+    pub fn filter_key_tracking(&self) -> f32 {
+        self.filter_key_tracking
+    }
+
+    pub fn filter_vel_tracking(&self) -> f32 {
+        self.filter_vel_tracking
+    }
+
+    pub fn filter_subtype(&self) -> FilterSubtype {
+        self.filter.subtype
+    }
+
+    pub fn amp_eg_params(&self) -> AdsrParams {
+        self.aeg.params()
+    }
+
+    pub fn filter_eg_params(&self) -> AdsrParams {
+        self.feg.params()
+    }
+
+    pub fn lfo1_enabled(&self) -> bool {
+        self.lfo1_enabled
+    }
+
     pub fn set_global_mod_matrix(&mut self, matrix: ModMatrix) {
         self.global_mod_matrix = matrix;
+    }
+
+    pub fn set_group_mod_matrix(&mut self, matrix: ModMatrix) {
+        self.group_mod_matrix = matrix;
     }
 
     pub fn set_sample_hold_rate(&mut self, rate: usize) {
@@ -761,8 +979,20 @@ impl SampleVoice {
         self.output_bus
     }
 
+    pub fn hierarchy_gain(&self) -> f32 {
+        self.hierarchy_gain
+    }
+
+    pub fn hierarchy_pan(&self) -> f32 {
+        self.hierarchy_pan
+    }
+
     pub fn set_tuning(&mut self, tuning: Option<crate::common::tuning::Tuning>) {
         self.tuning = tuning;
+    }
+
+    pub fn set_tuning_cents(&mut self, cents: f32) {
+        self.tuning_cents = cents;
     }
 
     pub fn set_oversample(&mut self, enabled: bool) {
@@ -781,11 +1011,12 @@ impl SampleVoice {
         self.note = note;
         self.zone = Some(zone.clone());
         self.sample = Some(zone.sample.clone());
-        let semitones = if self.pitch_bend_norm >= 0.0 {
-            self.pitch_bend_norm * self.pitch_bend_up
-        } else {
-            -self.pitch_bend_norm * self.pitch_bend_down
-        };
+        let semitones = self.tuning_cents / 100.0
+            + if self.pitch_bend_norm >= 0.0 {
+                self.pitch_bend_norm * self.pitch_bend_up
+            } else {
+                -self.pitch_bend_norm * self.pitch_bend_down
+            };
         let new_inc = if let Some(ref tuning) = self.tuning {
             zone.compute_increment_with_tuning(note, self.sample_rate, semitones, tuning)
         } else {
@@ -901,6 +1132,7 @@ impl SampleVoice {
         };
 
         let pitch_mod = zone.mod_matrix.compute(ModTarget::Pitch, &sources)
+            + self.group_mod_matrix.compute(ModTarget::Pitch, &sources)
             + self.global_mod_matrix.compute(ModTarget::Pitch, &sources);
 
         let original_increment = self.increment;
@@ -991,9 +1223,15 @@ impl SampleVoice {
             };
             let amp_mod = zone.mod_matrix.compute(ModTarget::Amplitude, &sources)
                 + self
+                    .group_mod_matrix
+                    .compute(ModTarget::Amplitude, &sources)
+                + self
                     .global_mod_matrix
                     .compute(ModTarget::Amplitude, &sources);
             let cutoff_mod = zone.mod_matrix.compute(ModTarget::FilterCutoff, &sources)
+                + self
+                    .group_mod_matrix
+                    .compute(ModTarget::FilterCutoff, &sources)
                 + self
                     .global_mod_matrix
                     .compute(ModTarget::FilterCutoff, &sources);
@@ -1001,9 +1239,13 @@ impl SampleVoice {
                 .mod_matrix
                 .compute(ModTarget::FilterResonance, &sources)
                 + self
+                    .group_mod_matrix
+                    .compute(ModTarget::FilterResonance, &sources)
+                + self
                     .global_mod_matrix
                     .compute(ModTarget::FilterResonance, &sources);
             let pan_mod = zone.mod_matrix.compute(ModTarget::Pan, &sources)
+                + self.group_mod_matrix.compute(ModTarget::Pan, &sources)
                 + self.global_mod_matrix.compute(ModTarget::Pan, &sources);
             let amp_factor = 1.0 + amp_mod;
             let (mod_pan_l, mod_pan_r) = crate::common::gain_pan::pan_gains(
@@ -1077,8 +1319,11 @@ impl SampleVoice {
                 let mut mod_resonance = self.filter_resonance * (1.0 + res_mod);
                 mod_resonance = mod_resonance.clamp(0.1, 10.0);
                 let key_track = self.filter_key_tracking * (self.note as f32 - 60.0) * 50.0;
+                let vel_track_cents =
+                    self.filter_vel_tracking * (1.0 - self.velocity as f32 / 127.0);
                 let mod_cutoff = self.filter_base_cutoff * 2.0f32.powf(octaves) + key_track;
-                let mod_cutoff = mod_cutoff.clamp(20.0, self.sample_rate * 0.49);
+                let mod_cutoff = (mod_cutoff * 2.0f32.powf(vel_track_cents / 1200.0))
+                    .clamp(20.0, self.sample_rate * 0.49);
 
                 if self.oversample {
                     self.filter.prepare_block(mod_cutoff, mod_resonance, 1);
@@ -1107,8 +1352,11 @@ impl SampleVoice {
                 let mut mod_resonance = self.filter2_resonance * (1.0 + res_mod);
                 mod_resonance = mod_resonance.clamp(0.1, 10.0);
                 let key_track = self.filter2_key_tracking * (self.note as f32 - 60.0) * 50.0;
+                let vel_track_cents =
+                    self.filter2_vel_tracking * (1.0 - self.velocity as f32 / 127.0);
                 let mod_cutoff = self.filter2_base_cutoff * 2.0f32.powf(octaves) + key_track;
-                let mod_cutoff = mod_cutoff.clamp(20.0, self.sample_rate * 0.49);
+                let mod_cutoff = (mod_cutoff * 2.0f32.powf(vel_track_cents / 1200.0))
+                    .clamp(20.0, self.sample_rate * 0.49);
 
                 if self.oversample {
                     self.filter2.prepare_block(mod_cutoff, mod_resonance, 1);

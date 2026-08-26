@@ -2,12 +2,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use crate::common::envelope::AdsrParams;
+use crate::common::filter::FilterParams;
 pub use crate::common::state::{
     PluginState, SamplerGroupState, SamplerModRouteState, SamplerZoneState,
 };
 use crate::sampler::dsp::mod_matrix::{ModCurve, ModMatrix, ModSource, ModTarget};
+use crate::sampler::dsp::voice::LfoParams;
 use crate::sampler::dsp::zone::{
-    CcCondition, CurveType, LoopDirection, LoopMode, SamplePlayMode, VariantMode,
+    CcCondition, CurveType, LoopDirection, LoopMode, OffMode, SamplePlayMode, VariantMode,
 };
 
 #[derive(Debug, Clone)]
@@ -19,6 +22,22 @@ pub struct SampleGroup {
     pub pan: f32,
     pub output: u8,
     pub extra_sfz_opcodes: Vec<(String, String)>,
+    pub sw_last: Option<u8>,
+    pub sw_down: Option<u8>,
+    pub sw_up: Option<u8>,
+    pub sw_previous: Option<u8>,
+    pub sw_lolast: Option<u8>,
+    pub sw_hilast: Option<u8>,
+    pub sw_default: Option<u8>,
+    pub sw_label: Option<String>,
+    pub eg1_params: Option<AdsrParams>,
+    pub eg2_params: Option<AdsrParams>,
+    pub lfo1_params: Option<LfoParams>,
+    pub lfo2_params: Option<LfoParams>,
+    pub lfo3_params: Option<LfoParams>,
+    pub lfo4_params: Option<LfoParams>,
+    pub filter_params: Option<FilterParams>,
+    pub mod_matrix: ModMatrix,
 }
 
 impl SampleGroup {
@@ -31,6 +50,22 @@ impl SampleGroup {
             pan: 0.0,
             output: 0,
             extra_sfz_opcodes: Vec::new(),
+            sw_last: None,
+            sw_down: None,
+            sw_up: None,
+            sw_previous: None,
+            sw_lolast: None,
+            sw_hilast: None,
+            sw_default: None,
+            sw_label: None,
+            eg1_params: None,
+            eg2_params: None,
+            lfo1_params: None,
+            lfo2_params: None,
+            lfo3_params: None,
+            lfo4_params: None,
+            filter_params: None,
+            mod_matrix: ModMatrix::default(),
         }
     }
 
@@ -43,10 +78,59 @@ impl SampleGroup {
             pan: Some(self.pan),
             output: Some(self.output),
             extra_sfz_opcodes: self.extra_sfz_opcodes.clone(),
+            sw_last: self.sw_last,
+            sw_down: self.sw_down,
+            sw_up: self.sw_up,
+            sw_previous: self.sw_previous,
+            sw_lolast: self.sw_lolast,
+            sw_hilast: self.sw_hilast,
+            sw_default: self.sw_default,
+            sw_label: self.sw_label.clone(),
+            eg1_params: self.eg1_params,
+            eg2_params: self.eg2_params,
+            lfo1_params: self.lfo1_params,
+            lfo2_params: self.lfo2_params,
+            lfo3_params: self.lfo3_params,
+            lfo4_params: self.lfo4_params,
+            filter_params: self.filter_params,
+            mod_routes: self
+                .mod_matrix
+                .routes
+                .iter()
+                .filter(|route| route.active)
+                .map(|route| SamplerModRouteState {
+                    source: route.source as u8,
+                    source_cc: route.source_cc,
+                    target: route.target as u8,
+                    depth: route.depth,
+                    active: route.active,
+                    source_curve: route.source_curve.points.to_vec(),
+                })
+                .collect(),
         }
     }
 
     pub fn from_state(state: &SamplerGroupState) -> Self {
+        let mut mod_matrix = ModMatrix::default();
+        for (index, route) in state
+            .mod_routes
+            .iter()
+            .take(mod_matrix.routes.len())
+            .enumerate()
+        {
+            let mut curve = ModCurve::linear();
+            for (point, value) in curve.points.iter_mut().zip(route.source_curve.iter()) {
+                *point = value.clamp(0.0, 1.0);
+            }
+            mod_matrix.routes[index] = crate::sampler::dsp::mod_matrix::ModRoute {
+                source: ModSource::from_u8(route.source),
+                source_cc: route.source_cc.min(127),
+                source_curve: curve,
+                target: ModTarget::from_u8(route.target),
+                depth: route.depth,
+                active: route.active,
+            };
+        }
         Self {
             name: if state.name.is_empty() {
                 String::from("New Group")
@@ -59,6 +143,22 @@ impl SampleGroup {
             pan: state.pan.unwrap_or(0.0),
             output: state.output.unwrap_or(0),
             extra_sfz_opcodes: state.extra_sfz_opcodes.clone(),
+            sw_last: state.sw_last,
+            sw_down: state.sw_down,
+            sw_up: state.sw_up,
+            sw_previous: state.sw_previous,
+            sw_lolast: state.sw_lolast,
+            sw_hilast: state.sw_hilast,
+            sw_default: state.sw_default,
+            sw_label: state.sw_label.clone(),
+            eg1_params: state.eg1_params,
+            eg2_params: state.eg2_params,
+            lfo1_params: state.lfo1_params,
+            lfo2_params: state.lfo2_params,
+            lfo3_params: state.lfo3_params,
+            lfo4_params: state.lfo4_params,
+            filter_params: state.filter_params,
+            mod_matrix,
         }
     }
 }
@@ -116,6 +216,9 @@ pub struct SampleZone {
     pub seq_length: u32,
     pub seq_position: u32,
     pub off_by: u8,
+    pub off_mode: OffMode,
+    pub amp_veltrack: f32,
+    pub count: u32,
     pub mod_matrix: ModMatrix,
     pub extra_sfz_opcodes: Vec<(String, String)>,
     pub output: u8,
@@ -183,6 +286,9 @@ impl SampleZone {
             seq_length: 0,
             seq_position: 0,
             off_by: 0,
+            off_mode: OffMode::Fast,
+            amp_veltrack: 100.0,
+            count: 0,
             mod_matrix: ModMatrix::default(),
             extra_sfz_opcodes: Vec::new(),
             output: 0,
@@ -254,6 +360,9 @@ impl SampleZone {
             seq_length: Some(self.seq_length),
             seq_position: Some(self.seq_position),
             off_by: Some(self.off_by),
+            off_mode: Some(self.off_mode as u8),
+            amp_veltrack: Some(self.amp_veltrack),
+            count: Some(self.count),
             mod_routes: self
                 .mod_matrix
                 .routes
@@ -377,6 +486,12 @@ impl SampleZone {
             seq_length: state.seq_length.unwrap_or(0),
             seq_position: state.seq_position.unwrap_or(0),
             off_by: state.off_by.unwrap_or(0),
+            off_mode: state
+                .off_mode
+                .map(crate::sampler::dsp::zone::OffMode::from_u8)
+                .unwrap_or(crate::sampler::dsp::zone::OffMode::Fast),
+            amp_veltrack: state.amp_veltrack.unwrap_or(100.0),
+            count: state.count.unwrap_or(0),
             mod_matrix,
             extra_sfz_opcodes: state.extra_sfz_opcodes.clone(),
             output: state.output.unwrap_or(0),

@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::common::ClapParamId;
+use crate::common::envelope::AdsrParams;
+use crate::common::filter::FilterParams;
 use crate::common::param_store::ParamStore;
+use crate::sampler::dsp::voice::LfoParams;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplerModRouteState {
@@ -116,6 +119,12 @@ pub struct SamplerZoneState {
     pub seq_position: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub off_by: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off_mode: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amp_veltrack: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mod_routes: Vec<SamplerModRouteState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -135,6 +144,38 @@ pub struct SamplerGroupState {
     pub pan: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_last: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_down: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_up: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_previous: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_lolast: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_hilast: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_default: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eg1_params: Option<AdsrParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eg2_params: Option<AdsrParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lfo1_params: Option<LfoParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lfo2_params: Option<LfoParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lfo3_params: Option<LfoParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lfo4_params: Option<LfoParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_params: Option<FilterParams>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mod_routes: Vec<SamplerModRouteState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_sfz_opcodes: Vec<(String, String)>,
 }

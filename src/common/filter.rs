@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterType {
     Off = 0,
     Lowpass = 1,
@@ -119,7 +121,7 @@ impl FilterType {
 /// Carries the filter type, cutoff, resonance, EG modulation amount, and
 /// related shaping state. Plugins can store this as a single field instead of
 /// passing every control separately.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FilterParams {
     pub filter_type: FilterType,
     pub subtype: FilterSubtype,
@@ -127,6 +129,7 @@ pub struct FilterParams {
     pub resonance: f32,
     pub eg_amount: f32,
     pub key_tracking: f32,
+    pub vel_tracking: f32,
     pub drive: f32,
     pub enabled: bool,
 }
@@ -140,6 +143,7 @@ impl Default for FilterParams {
             resonance: 0.7,
             eg_amount: 0.0,
             key_tracking: 0.0,
+            vel_tracking: 0.0,
             drive: 0.0,
             enabled: false,
         }
@@ -208,7 +212,7 @@ impl std::fmt::Display for FilterType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterSubtype {
     Clean = 0,
     MildDrive = 1,
@@ -233,6 +237,36 @@ pub enum FilterSubtype {
     XpanderHp3Lp1 = 19,
     XpanderN2Lp1 = 20,
     XpanderPh3Lp1 = 21,
+}
+
+impl std::fmt::Display for FilterSubtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Clean => "Clean",
+            Self::MildDrive => "MildDrive",
+            Self::HeavyDrive => "HeavyDrive",
+            Self::Asymmetric => "Asymmetric",
+            Self::SoftClip => "SoftClip",
+            Self::SineSat => "SineSat",
+            Self::Ojd => "Ojd",
+            Self::XpanderLp1 => "XpanderLp1",
+            Self::XpanderLp2 => "XpanderLp2",
+            Self::XpanderLp3 => "XpanderLp3",
+            Self::XpanderLp4 => "XpanderLp4",
+            Self::XpanderHp1 => "XpanderHp1",
+            Self::XpanderHp2 => "XpanderHp2",
+            Self::XpanderHp3 => "XpanderHp3",
+            Self::XpanderBp2 => "XpanderBp2",
+            Self::XpanderBp4 => "XpanderBp4",
+            Self::XpanderN2 => "XpanderN2",
+            Self::XpanderPh3 => "XpanderPh3",
+            Self::XpanderHp2Lp1 => "XpanderHp2Lp1",
+            Self::XpanderHp3Lp1 => "XpanderHp3Lp1",
+            Self::XpanderN2Lp1 => "XpanderN2Lp1",
+            Self::XpanderPh3Lp1 => "XpanderPh3Lp1",
+        };
+        write!(f, "{name}")
+    }
 }
 
 impl FilterSubtype {
