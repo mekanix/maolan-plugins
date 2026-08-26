@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::{CStr, c_char, c_void},
     io::{Read, Write},
     ptr::{NonNull, null, null_mut},
@@ -503,6 +504,131 @@ impl SharedState {
         let preset_index = *self.selected_sf2_preset.lock();
         self.load_file_with_preset(path, preset_index);
     }
+
+    /// Import an SFZ or SF2 file and merge its groups/zones into the currently
+    /// loaded instrument without replacing it.
+    pub fn import_file(self: Arc<Self>, path: std::path::PathBuf) {
+        self.wait_for_load_thread();
+
+        *self.load_status.lock() = SamplerLoadStatus::Parsing;
+        self.load_error.lock().take();
+        self.load_log
+            .lock()
+            .push(format!("Importing {}", path.display()));
+        let sample_rate = self.sample_rate.load(Ordering::Acquire) as f32;
+        let shared = Arc::clone(&self);
+        let handle = std::thread::spawn(move || {
+            let status = {
+                let shared = Arc::clone(&shared);
+                move |s| {
+                    shared.load_log.lock().push(load_status_message(&s));
+                    *shared.load_status.lock() = s;
+                }
+            };
+            match load_instrument_file_with_preset(
+                &path,
+                sample_rate,
+                None,
+                &shared.instrument_cache,
+                status,
+            ) {
+                Ok(instrument) => {
+                    let imported_patch = instrument.patch;
+                    let existing_patch = shared.patch.load();
+                    let merged_patch =
+                        merge_imported_patch(existing_patch.as_ref(), imported_patch.as_ref());
+                    shared
+                        .zones
+                        .store(Arc::new(build_zones_from_patch(&merged_patch)));
+                    shared
+                        .groups
+                        .store(Arc::new(build_groups_from_patch(&merged_patch)));
+                    shared.request_audio_ports_rescan();
+                    shared.bump_zones_version();
+                    shared.patch.store(Arc::new(merged_patch));
+                    shared.bump_patch_version();
+                    shared.note_names_changed();
+                    *shared.load_error.lock() = None;
+                    shared.mark_dirty();
+                    shared.load_log.lock().push(format!(
+                        "Imported {}: {} samples, {} zones",
+                        instrument.name, instrument.sample_count, instrument.zone_count
+                    ));
+                }
+                Err(e) => {
+                    *shared.load_status.lock() = SamplerLoadStatus::Error(e.clone());
+                    *shared.load_error.lock() = Some(e.clone());
+                    shared.load_log.lock().push(format!("Import error: {}", e));
+                }
+            }
+        });
+        *self.load_thread.lock() = Some(handle);
+    }
+}
+
+fn make_unique_name(base: &str, used: &HashSet<String>) -> String {
+    if !used.contains(base) {
+        return base.to_string();
+    }
+    let mut index = 2;
+    loop {
+        let candidate = format!("{base} {index}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+pub(crate) fn merge_imported_patch(existing: &Patch, imported: &Patch) -> Patch {
+    let mut merged = existing.clone();
+
+    if merged.parts.is_empty() {
+        merged.parts.push(Part::default());
+    }
+
+    let mut used_group_names: HashSet<String> = merged
+        .parts
+        .iter()
+        .flat_map(|part| part.groups.iter().map(|group| group.name.clone()))
+        .collect();
+    let mut used_zone_names: HashSet<String> = merged
+        .parts
+        .iter()
+        .flat_map(|part| {
+            part.groups
+                .iter()
+                .flat_map(|group| group.zones.iter().map(|zone| zone.name.clone()))
+        })
+        .collect();
+
+    let target_groups = &mut merged.parts[0].groups;
+    for part in &imported.parts {
+        for group in &part.groups {
+            let mut group = group.clone();
+            let base_name = if group.name.is_empty() {
+                String::from("Imported")
+            } else {
+                group.name.clone()
+            };
+            group.name = make_unique_name(&base_name, &used_group_names);
+            used_group_names.insert(group.name.clone());
+
+            for zone in &mut group.zones {
+                let base_zone = if zone.name.is_empty() {
+                    String::from("Imported Zone")
+                } else {
+                    zone.name.clone()
+                };
+                zone.name = make_unique_name(&base_zone, &used_zone_names);
+                used_zone_names.insert(zone.name.clone());
+            }
+
+            target_groups.push(group);
+        }
+    }
+
+    merged
 }
 
 fn load_status_message(status: &SamplerLoadStatus) -> String {
@@ -1004,6 +1130,7 @@ pub(crate) fn build_zones_from_patch(patch: &Patch) -> Vec<SampleZone> {
                 sample_zone.key_tracking_curve = zone.key_tracking_curve;
                 sample_zone.gain_db = zone.gain_db;
                 sample_zone.pan = zone.pan;
+                sample_zone.output = zone.output;
                 sample_zone.width = zone.width;
                 sample_zone.position = zone.position;
                 sample_zone.amp_keytrack_db = zone.amp_keytrack_db;
@@ -1055,6 +1182,7 @@ pub(crate) fn build_groups_from_patch(patch: &Patch) -> Vec<SampleGroup> {
                 sample_group.exclusive_group = group.exclusive_group;
                 sample_group.gain_db = group.gain_db;
                 sample_group.pan = group.pan;
+                sample_group.output = group.output;
                 sample_group.extra_sfz_opcodes = group.extra_sfz_opcodes.clone();
                 groups.push(sample_group);
             }
@@ -1063,14 +1191,12 @@ pub(crate) fn build_groups_from_patch(patch: &Patch) -> Vec<SampleGroup> {
     groups
 }
 
-fn normalize_groups(mut groups: Vec<SampleGroup>, zones: &[SampleZone]) -> Vec<SampleGroup> {
-    groups.retain(|group| !group.name.is_empty());
-    for zone in zones {
-        if !groups.iter().any(|group| group.name == zone.group) {
-            groups.push(SampleGroup::new(zone.group.clone()));
-        }
-    }
-    groups
+pub(crate) const MAX_SAMPLER_BUSES: usize = 32;
+
+pub(crate) fn required_output_bus_count(groups: &[SampleGroup], zones: &[SampleZone]) -> usize {
+    let max_group = groups.iter().map(|g| g.output as usize).max().unwrap_or(0);
+    let max_zone = zones.iter().map(|z| z.output as usize).max().unwrap_or(0);
+    (max_group.max(max_zone) + 1).clamp(1, MAX_SAMPLER_BUSES)
 }
 
 fn build_patch_from_zones(groups: &[SampleGroup], zones: &[SampleZone], sample_rate: f32) -> Patch {
@@ -1092,6 +1218,7 @@ fn build_patch_from_zones(groups: &[SampleGroup], zones: &[SampleZone], sample_r
             exclusive_group: group.exclusive_group,
             gain_db: group.gain_db,
             pan: group.pan,
+            output: group.output,
             extra_sfz_opcodes: group.extra_sfz_opcodes.clone(),
             zones: zones_by_group
                 .remove(&group.name)
@@ -1126,29 +1253,35 @@ fn build_patch_from_zones(groups: &[SampleGroup], zones: &[SampleZone], sample_r
 fn build_dsp_zone(zone: &SampleZone, sample_rate: f32) -> Zone {
     let mut variants = Vec::new();
     for file in &zone.files {
-        match crate::common::audio_file::decode_file(file) {
-            Ok(audio) => match audio.into_stereo() {
-                Ok(stereo) => {
-                    let peak = stereo.peak;
-                    let rms = stereo.rms;
-                    let file_sample_rate = stereo.sample_rate;
-                    let (data_l, data_r) = stereo.into_stereo_buffers();
-                    let frames = data_l.len();
-                    variants.push(Arc::new(Sample {
-                        sample_rate: file_sample_rate,
-                        data_l,
-                        data_r,
-                        frames,
-                        peak,
-                        rms,
-                        loop_start: None,
-                        loop_end: None,
-                        cue_points: Vec::new(),
-                    }));
-                }
+        if file
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("flac"))
+        {
+            match crate::common::audio_file::decode_file(file) {
+                Ok(audio) => match audio.into_stereo() {
+                    Ok(stereo) => {
+                        let peak = stereo.peak;
+                        let rms = stereo.rms;
+                        let file_sample_rate = stereo.sample_rate;
+                        let (data_l, data_r) = stereo.into_stereo_buffers();
+                        let frames = data_l.len();
+                        variants.push(Arc::new(Sample {
+                            sample_rate: file_sample_rate,
+                            data_l,
+                            data_r,
+                            frames,
+                            peak,
+                            rms,
+                            loop_start: None,
+                            loop_end: None,
+                            cue_points: Vec::new(),
+                        }));
+                    }
+                    Err(_) => variants.push(Arc::new(Sample::silent(sample_rate))),
+                },
                 Err(_) => variants.push(Arc::new(Sample::silent(sample_rate))),
-            },
-            Err(_) => variants.push(Arc::new(Sample::silent(sample_rate))),
+            }
         }
     }
 
@@ -1180,6 +1313,7 @@ fn build_dsp_zone(zone: &SampleZone, sample_rate: f32) -> Zone {
     dsp_zone.key_tracking_curve = zone.key_tracking_curve;
     dsp_zone.gain_db = zone.gain_db;
     dsp_zone.pan = zone.pan;
+    dsp_zone.output = zone.output;
     dsp_zone.width = zone.width;
     dsp_zone.position = zone.position;
     dsp_zone.amp_keytrack_db = zone.amp_keytrack_db;
@@ -1614,9 +1748,9 @@ impl AudioProcessor {
                         frames,
                     )
                 };
-                let group_index = (port_index / 2) as usize;
+                let bus_index = (port_index / 2) as usize;
                 let is_left = port_index.is_multiple_of(2);
-                match (self.group_outputs.get(group_index), channel) {
+                match (self.group_outputs.get(bus_index), channel) {
                     (Some((out_l, _)), 0) if is_left => dst.copy_from_slice(&out_l[..frames]),
                     (Some((_, out_r)), 0) => dst.copy_from_slice(&out_r[..frames]),
                     _ => dst.fill(0.0),
@@ -1752,7 +1886,8 @@ unsafe extern "C-unwind" fn ext_audio_ports_count(
     }
     let inst = unsafe { instance(plugin) };
     let groups = inst.shared.groups.load();
-    (groups.len().max(1) * 2) as u32
+    let zones = inst.shared.zones.load();
+    (required_output_bus_count(&groups, &zones) * 2) as u32
 }
 
 unsafe extern "C-unwind" fn ext_audio_ports_get(
@@ -1767,21 +1902,27 @@ unsafe extern "C-unwind" fn ext_audio_ports_get(
         }
         let inst = instance(plugin);
         let groups = inst.shared.groups.load();
-        let group_index = (index / 2) as usize;
-        let output_name = if groups.is_empty() && group_index == 0 {
+        let zones = inst.shared.zones.load();
+        let bus_index = (index / 2) as usize;
+        let bus_count = required_output_bus_count(&groups, &zones);
+        if bus_index >= bus_count {
+            return false;
+        }
+        let output_name = if bus_index == 0 {
             "Main"
         } else {
-            let Some(group) = groups.get(group_index) else {
-                return false;
-            };
-            group.name.as_str()
+            &format!("Bus {}", bus_index)
         };
         let info = &mut *info;
         info.id = index;
         info.channel_count = 1;
         let side = if index.is_multiple_of(2) { "L" } else { "R" };
         copy_str_to_array(&format!("{output_name} {side}"), &mut info.name);
-        info.flags = CLAP_AUDIO_PORT_IS_MAIN;
+        info.flags = if bus_index == 0 {
+            CLAP_AUDIO_PORT_IS_MAIN
+        } else {
+            0
+        };
         info.port_type = CLAP_PORT_MONO.as_ptr();
         info.in_place_pair = CLAP_INVALID_ID;
         true
@@ -1998,6 +2139,17 @@ unsafe extern "C-unwind" fn ext_params_flush(
     }
 }
 
+/// Expand a leading `~` in a path to the user's home directory.
+fn expand_tilde(path: std::path::PathBuf) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    path
+}
+
 static EXT_PARAMS: clap_plugin_params = clap_plugin_params {
     count: Some(ext_params_count),
     get_info: Some(ext_params_get_info),
@@ -2017,10 +2169,12 @@ unsafe extern "C-unwind" fn ext_state_save(
         }
         let inst = instance(plugin);
         let mut state = PluginState::from_runtime(&inst.shared.params);
-        let zones = inst.shared.zones.load();
-        state.sampler_zones = Some(zones.iter().map(SampleZone::to_state).collect());
-        let groups = inst.shared.groups.load();
-        state.sampler_groups = Some(groups.iter().map(SampleGroup::to_state).collect());
+        // Only persist the instrument path and selected SF2 preset.  The zone
+        // and group data is rebuilt by reloading the instrument on restore.
+        // Including every zone in the saved state makes the state blob too
+        // large for the plugin-host scratch buffer (64 KiB), which causes the
+        // DAW to store a null state and the drumkit to disappear after reopening
+        // the session.
         state.sampler_instrument_path = inst
             .shared
             .instrument_path
@@ -2028,8 +2182,11 @@ unsafe extern "C-unwind" fn ext_state_save(
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
         state.sampler_sf2_preset = *inst.shared.selected_sf2_preset.lock();
-        let Ok(bytes) = state.to_bytes() else {
-            return false;
+        let bytes = match state.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(_e) => {
+                return false;
+            }
         };
         let mut ostream = OStream::new_unchecked(stream);
         ostream.write_all(&bytes).is_ok()
@@ -2050,30 +2207,16 @@ unsafe extern "C-unwind" fn ext_state_load(
         if istream.read_to_end(&mut bytes).is_err() {
             return false;
         }
-        let Ok(state) = PluginState::from_bytes(&bytes) else {
-            return false;
+        let state = match PluginState::from_bytes(&bytes) {
+            Ok(state) => state,
+            Err(_e) => {
+                return false;
+            }
         };
         state.apply(&inst.shared.params);
-        let zones: Vec<SampleZone> = state
-            .sampler_zones
-            .as_ref()
-            .map(|zones| zones.iter().map(SampleZone::from_state).collect())
-            .unwrap_or_default();
-        let groups: Vec<SampleGroup> = state
-            .sampler_groups
-            .as_ref()
-            .map(|groups| groups.iter().map(SampleGroup::from_state).collect())
-            .unwrap_or_default();
-        let groups = normalize_groups(groups, &zones);
-        inst.shared.zones.store(Arc::new(zones));
-        inst.shared.groups.store(Arc::new(groups));
-        inst.shared.request_audio_ports_rescan();
-        inst.shared.bump_zones_version();
-        inst.shared.note_names_changed();
-        inst.shared.bump_params_version();
         if let Some(path) = state.sampler_instrument_path {
-            Arc::clone(&inst.shared)
-                .restore_file_with_preset(std::path::PathBuf::from(path), state.sampler_sf2_preset);
+            let path = expand_tilde(std::path::PathBuf::from(path));
+            Arc::clone(&inst.shared).restore_file_with_preset(path, state.sampler_sf2_preset);
         }
         true
     }

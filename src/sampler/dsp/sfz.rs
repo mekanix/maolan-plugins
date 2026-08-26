@@ -32,6 +32,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use crate::common::filter::{FilterParams, FilterType};
 use crate::common::lfo::{LfoShape, LfoSyncMode, LfoTriggerMode};
 use crate::sampler::dsp::group::{Group, TriggerType};
@@ -281,29 +283,57 @@ impl DefineTable {
     /// macro name. It does not support macro arguments.
     fn apply(&self, line: &str) -> String {
         let mut out = String::with_capacity(line.len());
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c.is_ascii_alphabetic() || c == '_' {
-                let mut ident = String::new();
-                ident.push(c);
-                while let Some(&ch) = chars.peek() {
-                    if ch.is_ascii_alphanumeric() || ch == '_' {
-                        ident.push(ch);
-                        chars.next();
-                    } else {
-                        break;
-                    }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '$' {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
                 }
+                let ident: String = chars[i..j].iter().collect();
+                if let Some(prefix_len) = Self::lookup_dollar_var(&self.defs, &ident)
+                    && let Some(value) = self.defs.get(&ident[..prefix_len])
+                {
+                    out.push_str(value);
+                    i += prefix_len;
+                    continue;
+                }
+            } else if c.is_ascii_alphabetic() || c == '_' {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let ident: String = chars[i..j].iter().collect();
                 if let Some(value) = self.defs.get(&ident) {
                     out.push_str(value);
-                } else {
-                    out.push_str(&ident);
+                    i = j;
+                    continue;
                 }
-            } else {
-                out.push(c);
             }
+            out.push(c);
+            i += 1;
         }
         out
+    }
+
+    fn lookup_dollar_var(defs: &HashMap<String, String>, ident: &str) -> Option<usize> {
+        if defs.contains_key(ident) {
+            return Some(ident.len());
+        }
+        let mut end = ident.len();
+        while let Some(pos) = ident[..end].rfind('_') {
+            if pos <= 1 {
+                break;
+            }
+            let prefix = &ident[..pos];
+            if defs.contains_key(prefix) {
+                return Some(pos);
+            }
+            end = pos;
+        }
+        None
     }
 
     fn is_defined(&self, name: &str) -> bool {
@@ -321,9 +351,18 @@ enum IfState {
 /// Pre-process SFZ text: strip comments, expand `#include`, apply `#define`,
 /// and resolve `#if`/`#else`/`#end`.
 fn preprocess(text: &str, base_dir: &Path) -> Result<String, SfzError> {
+    let mut defines = DefineTable::default();
+    preprocess_with_root(text, base_dir, base_dir, &mut defines)
+}
+
+fn preprocess_with_root(
+    text: &str,
+    base_dir: &Path,
+    root_dir: &Path,
+    defines: &mut DefineTable,
+) -> Result<String, SfzError> {
     let stripped = strip_comments(text);
     let mut output = String::new();
-    let mut defines = DefineTable::default();
     let mut if_stack: Vec<IfState> = Vec::new();
 
     for (line_no, line) in stripped.lines().enumerate() {
@@ -339,10 +378,12 @@ fn preprocess(text: &str, base_dir: &Path) -> Result<String, SfzError> {
                     if !is_active(&if_stack) {
                         continue;
                     }
-                    let path_str = parts
-                        .get(1)
-                        .ok_or_else(|| SfzError::new("#include missing path", line_no + 1, 1))?;
-                    let include_path = resolve_include_path(path_str, base_dir);
+                    if parts.len() < 2 {
+                        return Err(SfzError::new("#include missing path", line_no + 1, 1));
+                    }
+                    let path_str = parts[1..].join(" ");
+                    let include_path =
+                        resolve_include_path_with_root(&path_str, base_dir, root_dir);
                     let included = std::fs::read_to_string(&include_path).map_err(|e| {
                         SfzError::new(
                             format!("Failed to include {}: {}", include_path.display(), e),
@@ -350,8 +391,12 @@ fn preprocess(text: &str, base_dir: &Path) -> Result<String, SfzError> {
                             1,
                         )
                     })?;
-                    let processed =
-                        preprocess(&included, include_path.parent().unwrap_or(base_dir))?;
+                    let processed = preprocess_with_root(
+                        &included,
+                        include_path.parent().unwrap_or(base_dir),
+                        root_dir,
+                        defines,
+                    )?;
                     output.push_str(&processed);
                     output.push('\n');
                 }
@@ -372,7 +417,7 @@ fn preprocess(text: &str, base_dir: &Path) -> Result<String, SfzError> {
                 }
                 "if" => {
                     let condition = if parts.len() > 1 { parts[1] } else { "" };
-                    let active = is_active(&if_stack) && evaluate_if_condition(condition, &defines);
+                    let active = is_active(&if_stack) && evaluate_if_condition(condition, defines);
                     if active {
                         if_stack.push(IfState::Taking);
                     } else {
@@ -433,7 +478,7 @@ fn evaluate_if_condition(condition: &str, defines: &DefineTable) -> bool {
     }
 }
 
-fn resolve_include_path(spec: &str, base_dir: &Path) -> PathBuf {
+fn resolve_include_path_with_root(spec: &str, base_dir: &Path, root_dir: &Path) -> PathBuf {
     let spec = spec.trim();
     let spec = spec
         .strip_prefix('"')
@@ -442,11 +487,23 @@ fn resolve_include_path(spec: &str, base_dir: &Path) -> PathBuf {
         .unwrap_or(spec);
 
     let path = PathBuf::from(spec);
-    if path.is_absolute() {
+    let path = if path.is_absolute() {
         path
     } else {
-        base_dir.join(path)
+        base_dir.join(&path)
+    };
+    if path.canonicalize().is_ok() {
+        return path;
     }
+    let fallback = if PathBuf::from(spec).is_absolute() {
+        PathBuf::from(spec)
+    } else {
+        root_dir.join(spec)
+    };
+    if fallback.canonicalize().is_ok() {
+        return fallback;
+    }
+    path
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,6 +1071,7 @@ fn parse_sfz_text(text: &str, base_dir: &Path) -> Result<Patch, SfzError> {
     patch.parts.clear();
     let mut part = Part::default();
 
+    let mut control_opcodes: OpcodeMap = OpcodeMap::default();
     let mut global_opcodes: OpcodeMap = OpcodeMap::default();
     let mut group_opcodes: OpcodeMap = OpcodeMap::default();
     let mut master_opcodes: OpcodeMap = OpcodeMap::default();
@@ -1045,7 +1103,8 @@ fn parse_sfz_text(text: &str, base_dir: &Path) -> Result<Patch, SfzError> {
                         if let Some(g) = current_group.take() {
                             part.groups.push(g);
                         }
-                        group_opcodes = combine_maps(&global_opcodes, &master_opcodes);
+                        group_opcodes = combine_maps(&control_opcodes, &global_opcodes);
+                        group_opcodes = combine_maps(&group_opcodes, &master_opcodes);
                         group_opcodes.extend(&header_opcodes);
                         current_group = Some(build_group(&group_opcodes));
                     }
@@ -1061,9 +1120,9 @@ fn parse_sfz_text(text: &str, base_dir: &Path) -> Result<Patch, SfzError> {
                         }
                     }
                     "control" => {
-                        // Control opcodes affect the whole file (e.g. `default_path`).
-                        // They are merged into globals for now.
-                        global_opcodes.extend(&header_opcodes);
+                        // Control opcodes affect the whole file (e.g. `default_path`)
+                        // and persist across `<global>` resets.
+                        control_opcodes.extend(&header_opcodes);
                     }
                     "curve" => {
                         if let Some((index, curve)) = build_mod_curve(&header_opcodes) {
@@ -1087,7 +1146,26 @@ fn parse_sfz_text(text: &str, base_dir: &Path) -> Result<Patch, SfzError> {
         part.groups.push(g);
     }
     patch.parts.push(part);
+    load_patch_samples(&mut patch);
     Ok(patch)
+}
+
+/// Load all sample files referenced by a patch in parallel.
+fn load_patch_samples(patch: &mut Patch) {
+    let mut jobs: Vec<(&Path, &mut Arc<Sample>)> = Vec::new();
+    for part in &mut patch.parts {
+        for group in &mut part.groups {
+            for zone in &mut group.zones {
+                if let Some(path) = zone.files.first() {
+                    jobs.push((path, &mut zone.sample));
+                }
+            }
+        }
+    }
+
+    jobs.into_par_iter().for_each(|(path, sample_slot)| {
+        *sample_slot = load_audio(path).unwrap_or_else(|_| Arc::new(Sample::silent(48000.0)));
+    });
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1195,6 +1273,7 @@ fn is_vendor_sfz_opcode(key: &str) -> bool {
 
 const GROUP_HANDLED_OPCODES: &[&str] = &[
     "default_path",
+    "output",
     "sw_last",
     "sw_down",
     "sw_up",
@@ -1234,6 +1313,7 @@ const GROUP_HANDLED_OPCODES: &[&str] = &[
 
 const ZONE_HANDLED_OPCODES: &[&str] = &[
     "default_path",
+    "output",
     "sample",
     "key",
     "lokey",
@@ -1454,6 +1534,9 @@ fn build_group(opcodes: &OpcodeMap) -> Group {
     if let Some(p) = get_float(opcodes, "group_pan") {
         group.pan = p.clamp(-100.0, 100.0) / 100.0;
     }
+    if let Some(o) = get_int(opcodes, "output") {
+        group.output = o.clamp(0, 15) as u8;
+    }
 
     // SFZ amp/filter/pitch EGs and LFOs are mapped to the group's processors.
     group.eg1 = parse_amp_eg(opcodes);
@@ -1649,17 +1732,25 @@ fn build_zone(
         return None;
     }
 
+    let is_silence = sample_path.eq_ignore_ascii_case("*silence");
     let default_path = opcodes.get("default_path").unwrap_or("");
     let full_path = base_dir.join(default_path).join(sample_path);
-    let sample = match load_audio(&full_path) {
-        Ok(s) => s,
-        Err(_) => Arc::new(Sample::silent(48000.0)),
-    };
 
     let mut zone = Zone::default();
-    zone.sample = sample.clone();
-    zone.name = sample_path.to_string();
-    zone.files = vec![full_path.clone()];
+    // Samples are loaded in parallel after parsing; use a silent placeholder for now.
+    zone.sample = Arc::new(Sample::silent(48000.0));
+    zone.name = if is_silence {
+        String::from("*silence")
+    } else {
+        sample_path.to_string()
+    };
+    // *silence is an SFZ/ARIA convention for a region that triggers logic but
+    // plays no audio; it has no sample file to load.
+    zone.files = if is_silence {
+        Vec::new()
+    } else {
+        vec![full_path]
+    };
 
     // Key mapping.
     if let Some(key) = get_note(opcodes, "key") {
@@ -1675,6 +1766,9 @@ fn build_zone(
     }
     if let Some(key) = get_note(opcodes, "pitch_keycenter") {
         zone.root_key = key;
+    }
+    if let Some(o) = get_int(opcodes, "output") {
+        zone.output = o.clamp(0, 15) as u8;
     }
 
     // Velocity mapping.
@@ -2109,6 +2203,62 @@ mod tests {
         assert_eq!(group.zones[0].vel_low, 1);
         assert_eq!(group.zones[1].key_low, 62);
         assert_eq!(group.zones[1].pitch_offset, 12.0);
+    }
+
+    #[test]
+    fn test_parse_sfz_silence_samples() {
+        let text = r#"
+<group>
+<region> sample=* key=60
+<region> sample=*silence key=61
+<region> sample=kick.wav key=62
+"#;
+        let patch = parse_sfz_text(text, Path::new("/tmp")).unwrap();
+        let zones = &patch.parts[0].groups[0].zones;
+        assert_eq!(
+            zones.len(),
+            2,
+            "* should be skipped, *silence and real sample kept"
+        );
+        assert!(
+            zones[0].files.is_empty(),
+            "*silence zone should have no sample file"
+        );
+        assert_eq!(zones[0].key_low, 61);
+        assert_eq!(zones[1].files.len(), 1);
+        assert!(zones[1].files[0].ends_with("kick.wav"));
+        assert_eq!(zones[1].key_low, 62);
+    }
+
+    #[test]
+    fn test_control_default_path_persists_across_global() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("maolan-sfz-test-ctrl");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("Samples")).unwrap();
+
+        let sfz_path = dir.join("User").join("test.sfz");
+        std::fs::create_dir_all(sfz_path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&sfz_path).unwrap();
+        writeln!(f, "<control>").unwrap();
+        writeln!(f, "default_path=../Samples/").unwrap();
+        writeln!(f, "<global>").unwrap();
+        writeln!(f, "loop_mode=one_shot").unwrap();
+        writeln!(f, "<group>").unwrap();
+        writeln!(f, "<region> sample=kick.flac key=36").unwrap();
+        drop(f);
+
+        let patch = parse_sfz(sfz_path.to_str().unwrap()).unwrap();
+        let zone = &patch.parts[0].groups[0].zones[0];
+        assert!(
+            zone.files[0].ends_with("Samples/kick.flac"),
+            "expected default_path from <control> to persist after <global>, got {:?}",
+            zone.files[0]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

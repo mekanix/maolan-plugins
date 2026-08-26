@@ -185,6 +185,8 @@ pub struct SampleVoice {
 
     part_index: usize,
 
+    output_bus: usize,
+
     tuning: Option<crate::common::tuning::Tuning>,
 
     global_mod_matrix: ModMatrix,
@@ -271,6 +273,7 @@ impl SampleVoice {
             portamento_samples: 0,
             group_index: 0,
             part_index: 0,
+            output_bus: 0,
             tuning: None,
             global_mod_matrix: ModMatrix::default(),
             oversample: false,
@@ -748,6 +751,14 @@ impl SampleVoice {
     pub fn set_group_part_index(&mut self, group_index: usize, part_index: usize) {
         self.group_index = group_index;
         self.part_index = part_index;
+    }
+
+    pub fn set_output_bus(&mut self, output_bus: usize) {
+        self.output_bus = output_bus;
+    }
+
+    pub fn output_bus(&self) -> usize {
+        self.output_bus
     }
 
     pub fn set_tuning(&mut self, tuning: Option<crate::common::tuning::Tuning>) {

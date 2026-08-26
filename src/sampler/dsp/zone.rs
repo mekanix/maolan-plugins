@@ -243,6 +243,8 @@ pub struct Zone {
     pub mod_matrix: ModMatrix,
 
     pub extra_sfz_opcodes: Vec<(String, String)>,
+
+    pub output: u8,
 }
 
 impl Clone for Zone {
@@ -307,6 +309,7 @@ impl Clone for Zone {
             pool_position: AtomicUsize::new(self.pool_position.load(Ordering::Relaxed)),
             mod_matrix: self.mod_matrix.clone(),
             extra_sfz_opcodes: self.extra_sfz_opcodes.clone(),
+            output: self.output,
         }
     }
 }
@@ -373,6 +376,7 @@ impl Default for Zone {
             pool_position: AtomicUsize::new(0),
             mod_matrix: ModMatrix::default(),
             extra_sfz_opcodes: Vec::new(),
+            output: 0,
         }
     }
 }

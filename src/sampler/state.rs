@@ -17,6 +17,7 @@ pub struct SampleGroup {
     pub exclusive_group: u8,
     pub gain_db: f32,
     pub pan: f32,
+    pub output: u8,
     pub extra_sfz_opcodes: Vec<(String, String)>,
 }
 
@@ -28,6 +29,7 @@ impl SampleGroup {
             exclusive_group: 0,
             gain_db: 0.0,
             pan: 0.0,
+            output: 0,
             extra_sfz_opcodes: Vec::new(),
         }
     }
@@ -39,6 +41,7 @@ impl SampleGroup {
             exclusive_group: Some(self.exclusive_group),
             gain_db: Some(self.gain_db),
             pan: Some(self.pan),
+            output: Some(self.output),
             extra_sfz_opcodes: self.extra_sfz_opcodes.clone(),
         }
     }
@@ -54,6 +57,7 @@ impl SampleGroup {
             exclusive_group: state.exclusive_group.unwrap_or(0),
             gain_db: state.gain_db.unwrap_or(0.0),
             pan: state.pan.unwrap_or(0.0),
+            output: state.output.unwrap_or(0),
             extra_sfz_opcodes: state.extra_sfz_opcodes.clone(),
         }
     }
@@ -114,6 +118,7 @@ pub struct SampleZone {
     pub off_by: u8,
     pub mod_matrix: ModMatrix,
     pub extra_sfz_opcodes: Vec<(String, String)>,
+    pub output: u8,
 }
 
 impl SampleZone {
@@ -180,6 +185,7 @@ impl SampleZone {
             off_by: 0,
             mod_matrix: ModMatrix::default(),
             extra_sfz_opcodes: Vec::new(),
+            output: 0,
         }
     }
 
@@ -263,6 +269,7 @@ impl SampleZone {
                 })
                 .collect(),
             extra_sfz_opcodes: self.extra_sfz_opcodes.clone(),
+            output: Some(self.output),
         }
     }
 
@@ -372,6 +379,7 @@ impl SampleZone {
             off_by: state.off_by.unwrap_or(0),
             mod_matrix,
             extra_sfz_opcodes: state.extra_sfz_opcodes.clone(),
+            output: state.output.unwrap_or(0),
         }
     }
 }

@@ -804,8 +804,8 @@ impl SamplerEngine {
             if !voice.is_active() {
                 continue;
             }
-            let group_index = voice.group_index().min(outputs.len().saturating_sub(1));
-            let (out_l, out_r) = &mut outputs[group_index];
+            let bus_index = voice.output_bus().min(outputs.len().saturating_sub(1));
+            let (out_l, out_r) = &mut outputs[bus_index];
             voice.process_block(&mut out_l[..frames], &mut out_r[..frames]);
         }
 
@@ -980,6 +980,7 @@ impl SamplerEngine {
             params.part_pan,
         );
         self.voices[index].set_group_part_index(args.group_index, args.part_index);
+        self.voices[index].set_output_bus(args.zone.output as usize);
         let microtuning = self
             .patch
             .parts

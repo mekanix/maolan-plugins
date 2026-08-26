@@ -123,7 +123,9 @@ pub enum Message {
     OpenBrowserEntry(PathBuf),
     BeginAudioFileDrag(PathBuf),
     LoadInstrument(PathBuf),
+    ImportInstrument(PathBuf),
     PickInstrumentFile,
+    PickImportFile,
     ReloadInstrument,
     ExportSfz,
     SelectSf2Preset(PresetInfo),
@@ -683,6 +685,7 @@ fn apply_editable_zone_metadata(zone: &mut Zone, editable: &SampleZone) {
     zone.key_tracking_curve = editable.key_tracking_curve;
     zone.gain_db = editable.gain_db;
     zone.pan = editable.pan;
+    zone.output = editable.output;
     zone.width = editable.width;
     zone.position = editable.position;
     zone.amp_keytrack_db = editable.amp_keytrack_db;
@@ -741,6 +744,7 @@ fn export_patch_from_state(state: &State) -> Patch {
             exclusive_group: group.exclusive_group,
             gain_db: group.gain_db,
             pan: group.pan,
+            output: group.output,
             extra_sfz_opcodes: group.extra_sfz_opcodes.clone(),
             ..Default::default()
         })
@@ -1183,12 +1187,23 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             Message::LoadInstrument(path) => {
                 Arc::clone(&state.shared).load_file(path);
             }
+            Message::ImportInstrument(path) => {
+                Arc::clone(&state.shared).import_file(path);
+            }
             Message::PickInstrumentFile => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Sampler instruments", &["sfz", "sf2"])
+                    .add_filter("Sampler instruments", &["sfz", "sf2", "ariax"])
                     .pick_file()
                 {
                     Arc::clone(&state.shared).load_file(path);
+                }
+            }
+            Message::PickImportFile => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Sampler instruments", &["sfz", "sf2", "ariax"])
+                    .pick_file()
+                {
+                    Arc::clone(&state.shared).import_file(path);
                 }
             }
             Message::ReloadInstrument => {
@@ -3558,6 +3573,9 @@ fn instrument_panel<'a>(state: &'a State) -> Element<'a, Message> {
     let mut controls = row![
         button(text("Load").size(11))
             .on_press(Message::PickInstrumentFile)
+            .padding([4, 8]),
+        button(text("Import").size(11))
+            .on_press(Message::PickImportFile)
             .padding([4, 8]),
         button(text("Reload").size(11))
             .on_press(Message::ReloadInstrument)

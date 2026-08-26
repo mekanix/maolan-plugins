@@ -59,6 +59,8 @@ pub struct Group {
 
     pub extra_sfz_opcodes: Vec<(String, String)>,
 
+    pub output: u8,
+
     pub trigger_type: TriggerType,
 
     pub trigger_note: u8,
@@ -95,6 +97,7 @@ impl Default for Group {
             gain_db: 0.0,
             pan: 0.0,
             extra_sfz_opcodes: Vec::new(),
+            output: 0,
             trigger_type: TriggerType::None,
             trigger_note: 0,
             trigger_active: false,
