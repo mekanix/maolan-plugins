@@ -2690,6 +2690,7 @@ dependencies = [
  "oxideav-mp3",
  "oxideav-ogg",
  "parking_lot",
+ "pitch-detection",
  "portable-atomic",
  "quick-xml",
  "rand 0.10.2",
@@ -3665,6 +3666,15 @@ dependencies = [
  "atomic-waker",
  "fastrand",
  "futures-io",
+]
+
+[[package]]
+name = "pitch-detection"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e086e70dfcfd46cd6097c501a66fb07cd73ee8c27844b0941d9b2b3e43dfbf92"
+dependencies = [
+ "rustfft",
 ]
 
 [[package]]

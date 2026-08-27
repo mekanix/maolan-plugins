@@ -30,6 +30,7 @@ oxideav-basic = "0.0.9"
 oxideav-flac = "0.0.11"
 oxideav-mp3 = "0.1.3"
 oxideav-ogg = "0.1.8"
+pitch-detection = "0.3.0"
 symphonia = { version = "0.5.4", features = ["aac", "alac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
 maolan-baseview = { version = "0.0.5", features = ["canvas"] }
 maolan-editor = "0.0.1"
