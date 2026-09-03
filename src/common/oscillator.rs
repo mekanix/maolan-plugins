@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
 use std::f32::consts::PI;
+use std::sync::Arc;
 
 use crate::common::filter::{Filter, FilterType};
 use crate::common::twist::TwistOsc;
+use crate::common::unison;
 use crate::common::wavetable::Wavetable;
 
 const DEFAULT_LOWCUT_HZ: f32 = 20.0;
@@ -15,7 +17,7 @@ pub fn note_to_freq(midi_note: f32) -> f32 {
 }
 
 #[inline]
-fn poly_blep(t: f32, dt: f32) -> f32 {
+pub(crate) fn poly_blep(t: f32, dt: f32) -> f32 {
     if dt <= 0.0 {
         return 0.0;
     }
@@ -39,15 +41,21 @@ fn soft_clip(x: f32) -> f32 {
 pub struct UnisonVoice {
     pub phase: f32,
     pub phase_inc: f32,
-    pub pan: f32,
+    pub pan_l: f32,
+    pub pan_r: f32,
+    /// One-sample BLEP residual pending on the sample after a hard-sync
+    /// phase reset (Classic osc only; other oscs leave this at zero).
+    pub pending_sync_blep: f32,
 }
 
 impl UnisonVoice {
-    pub fn new(phase: f32, phase_inc: f32, pan: f32) -> Self {
+    pub fn new(phase: f32, phase_inc: f32, pan_l: f32, pan_r: f32) -> Self {
         Self {
             phase,
             phase_inc,
-            pan,
+            pan_l,
+            pan_r,
+            pending_sync_blep: 0.0,
         }
     }
 }
@@ -183,7 +191,7 @@ impl ClassicOsc {
             unison_voices: 1,
             unison_detune: 0.0,
             unison_spread: 1.0,
-            voices: vec![UnisonVoice::new(0.0, 0.0, 0.5)],
+            voices: vec![UnisonVoice::new(0.0, 0.0, 0.5, 0.5)],
             sync_amount: 0.0,
             sync_phases: vec![0.0],
         }
@@ -240,7 +248,7 @@ impl ClassicOsc {
         self.unison_voices = voices.clamp(1, 16);
         self.unison_detune = detune.clamp(0.0, 1.0);
         self.voices.resize_with(self.unison_voices, || {
-            UnisonVoice::new(rand::random(), 0.0, 0.5)
+            UnisonVoice::new(rand::random(), 0.0, 0.5, 0.5)
         });
         self.sync_phases
             .resize_with(self.unison_voices, rand::random);
@@ -254,20 +262,12 @@ impl ClassicOsc {
 
     fn update_voices(&mut self) {
         let base_inc = self.freq_hz / self.sample_rate;
-        let detune_scale = self.unison_detune * 0.05;
         let n = self.unison_voices;
         for (i, voice) in self.voices.iter_mut().enumerate() {
-            let offset = if n > 1 {
-                (i as f32 / (n as f32 - 1.0) - 0.5) * 2.0 * detune_scale
-            } else {
-                0.0
-            };
-            voice.phase_inc = base_inc * 2.0f32.powf(offset / 12.0);
-            voice.pan = if n > 1 {
-                i as f32 / (n as f32 - 1.0)
-            } else {
-                0.5
-            };
+            voice.phase_inc = base_inc * unison::detune_ratio(i, n, self.unison_detune);
+            let (pan_l, pan_r) = unison::pan_gains(i, n, self.unison_spread);
+            voice.pan_l = pan_l;
+            voice.pan_r = pan_r;
         }
     }
 
@@ -318,6 +318,34 @@ impl ClassicOsc {
         }
     }
 
+    /// BLEP residual for a hard-sync phase reset, applied to the first sample
+    /// rendered after the reset.
+    ///
+    /// The master wrap is detected after the current sample was rendered, so
+    /// the slave phase jumps to zero exactly on the next sample boundary: the
+    /// rendered signal steps from the pre-reset value `out` to the naive
+    /// waveform value at the post-reset phase. A polyBLEP discontinuity with
+    /// zero fractional misalignment contributes a single-sample residual of
+    /// `-jump / 2` at that boundary, pulling the post-reset sample to the
+    /// midpoint of the step (a two-sample transition instead of a naked
+    /// full-bandwidth edge, which is what clicks and aliases).
+    fn sync_reset_blep(
+        pulse_width: f32,
+        current_wf: ClassicWaveform,
+        next_wf: ClassicWaveform,
+        morph: f32,
+        out: f32,
+        fm_shift: f32,
+        vdt: f32,
+    ) -> f32 {
+        let t_next = (vdt + fm_shift).fract();
+        let t_next = if t_next < 0.0 { t_next + 1.0 } else { t_next };
+        let after_current = Self::generate_waveform(current_wf, pulse_width, t_next, vdt);
+        let after_next = Self::generate_waveform(next_wf, pulse_width, t_next, vdt);
+        let after = after_current * (1.0 - morph) + after_next * morph;
+        -0.5 * (after - out)
+    }
+
     pub fn next(&mut self, fm_input: f32) -> (f32, f32) {
         let mut sum_l = 0.0f32;
         let mut sum_r = 0.0f32;
@@ -337,13 +365,31 @@ impl ClassicOsc {
             let next = Self::generate_waveform(next_wf, pulse_width, t, vdt);
             let mut out = current * (1.0 - morph) + next * morph;
 
+            if voice.pending_sync_blep != 0.0 {
+                out += voice.pending_sync_blep;
+                voice.pending_sync_blep = 0.0;
+            }
+
             if self.sync_amount > 0.0 {
                 let sync_ratio = 2.0f32.powf(self.sync_amount / 12.0);
                 let sync_inc = vdt * sync_ratio;
                 self.sync_phases[i] += sync_inc;
+                let mut reset = false;
                 while self.sync_phases[i] >= 1.0 {
                     self.sync_phases[i] -= 1.0;
                     voice.phase = 0.0;
+                    reset = true;
+                }
+                if reset {
+                    voice.pending_sync_blep = Self::sync_reset_blep(
+                        pulse_width,
+                        current_wf,
+                        next_wf,
+                        morph,
+                        out,
+                        fm_shift,
+                        vdt,
+                    );
                 }
             }
 
@@ -353,9 +399,8 @@ impl ClassicOsc {
             }
 
             out = soft_clip(out);
-            let pan = voice.pan;
-            sum_l += out * (1.0 - pan);
-            sum_r += out * pan;
+            sum_l += out * voice.pan_l;
+            sum_r += out * voice.pan_r;
         }
 
         if self.sub_level > 0.0 {
@@ -395,13 +440,31 @@ impl ClassicOsc {
             let next = Self::generate_waveform(next_wf, pulse_width, t, vdt);
             let mut out = current * (1.0 - morph) + next * morph;
 
+            if voice.pending_sync_blep != 0.0 {
+                out += voice.pending_sync_blep;
+                voice.pending_sync_blep = 0.0;
+            }
+
             if self.sync_amount > 0.0 {
                 let sync_ratio = 2.0f32.powf(self.sync_amount / 12.0);
                 let sync_inc = vdt * sync_ratio;
                 self.sync_phases[i] += sync_inc;
+                let mut reset = false;
                 while self.sync_phases[i] >= 1.0 {
                     self.sync_phases[i] -= 1.0;
                     voice.phase = 0.0;
+                    reset = true;
+                }
+                if reset {
+                    voice.pending_sync_blep = Self::sync_reset_blep(
+                        pulse_width,
+                        current_wf,
+                        next_wf,
+                        morph,
+                        out,
+                        fm_shift,
+                        vdt,
+                    );
                 }
             }
 
@@ -542,10 +605,13 @@ pub struct SineOsc {
     feedback: f32,
     lowcut: Filter,
     highcut: Filter,
+    lowcut_r: Filter,
+    highcut_r: Filter,
     lowcut_hz: f32,
     highcut_hz: f32,
     unison_voices: usize,
     unison_detune: f32,
+    unison_spread: f32,
     voices: Vec<UnisonVoice>,
     voice_feedback: Vec<f32>,
 }
@@ -560,6 +626,8 @@ impl SineOsc {
         highcut.set_filter_type(FilterType::Lowpass12dB);
         highcut.set_params(20000.0, 0.7);
         highcut.prepare_block(20000.0, 0.7, 1);
+        let lowcut_r = lowcut.clone();
+        let highcut_r = highcut.clone();
         Self {
             sample_rate,
             phase: 0.0,
@@ -570,11 +638,14 @@ impl SineOsc {
             feedback: 0.0,
             lowcut,
             highcut,
+            lowcut_r,
+            highcut_r,
             lowcut_hz: 20.0,
             highcut_hz: 20000.0,
             unison_voices: 1,
             unison_detune: 0.0,
-            voices: vec![UnisonVoice::new(0.0, 0.0, 0.5)],
+            unison_spread: 1.0,
+            voices: vec![UnisonVoice::new(0.0, 0.0, 0.5, 0.5)],
             voice_feedback: vec![0.0],
         }
     }
@@ -609,6 +680,8 @@ impl SineOsc {
         self.lowcut_hz = f;
         self.lowcut.set_params(f, 0.7);
         self.lowcut.prepare_block(f, 0.7, 1);
+        self.lowcut_r.set_params(f, 0.7);
+        self.lowcut_r.prepare_block(f, 0.7, 1);
     }
 
     pub fn set_highcut(&mut self, freq: f32) {
@@ -616,6 +689,8 @@ impl SineOsc {
         self.highcut_hz = f;
         self.highcut.set_params(f, 0.7);
         self.highcut.prepare_block(f, 0.7, 1);
+        self.highcut_r.set_params(f, 0.7);
+        self.highcut_r.prepare_block(f, 0.7, 1);
     }
 
     fn lowcut_enabled(&self) -> bool {
@@ -630,28 +705,25 @@ impl SineOsc {
         self.unison_voices = voices.clamp(1, 16);
         self.unison_detune = detune.clamp(0.0, 1.0);
         self.voices.resize_with(self.unison_voices, || {
-            UnisonVoice::new(rand::random(), 0.0, 0.5)
+            UnisonVoice::new(rand::random(), 0.0, 0.5, 0.5)
         });
         self.voice_feedback.resize(self.unison_voices, 0.0);
         self.update_voices();
     }
 
+    pub fn set_unison_spread(&mut self, spread: f32) {
+        self.unison_spread = spread.clamp(0.0, 1.0);
+        self.update_voices();
+    }
+
     fn update_voices(&mut self) {
         let base_inc = self.freq_hz / self.sample_rate;
-        let detune_scale = self.unison_detune * 0.05;
         let n = self.unison_voices;
         for (i, voice) in self.voices.iter_mut().enumerate() {
-            let offset = if n > 1 {
-                (i as f32 / (n as f32 - 1.0) - 0.5) * 2.0 * detune_scale
-            } else {
-                0.0
-            };
-            voice.phase_inc = base_inc * 2.0f32.powf(offset / 12.0);
-            voice.pan = if n > 1 {
-                i as f32 / (n as f32 - 1.0)
-            } else {
-                0.5
-            };
+            voice.phase_inc = base_inc * unison::detune_ratio(i, n, self.unison_detune);
+            let (pan_l, pan_r) = unison::pan_gains(i, n, self.unison_spread);
+            voice.pan_l = pan_l;
+            voice.pan_r = pan_r;
         }
     }
 
@@ -926,9 +998,8 @@ impl SineOsc {
                 }
             }
 
-            let pan = voice.pan;
-            sum_l += shaped * (1.0 - pan);
-            sum_r += shaped * pan;
+            sum_l += shaped * voice.pan_l;
+            sum_r += shaped * voice.pan_r;
         }
 
         let atten = 1.0 / (self.unison_voices as f32).sqrt();
@@ -937,16 +1008,16 @@ impl SineOsc {
 
         if self.lowcut_enabled() {
             self.lowcut.prepare_block(self.lowcut_hz, 0.7, 1);
-            let mut lowcut_r = self.lowcut.clone();
+            self.lowcut_r.prepare_block(self.lowcut_hz, 0.7, 1);
             out_l = self.lowcut.process(out_l);
-            out_r = lowcut_r.process(out_r);
+            out_r = self.lowcut_r.process(out_r);
         }
 
         if self.highcut_enabled() {
             self.highcut.prepare_block(self.highcut_hz, 0.7, 1);
-            let mut highcut_r = self.highcut.clone();
+            self.highcut_r.prepare_block(self.highcut_hz, 0.7, 1);
             out_l = self.highcut.process(out_l);
-            out_r = highcut_r.process(out_r);
+            out_r = self.highcut_r.process(out_r);
         }
         (out_l, out_r)
     }
@@ -1262,6 +1333,7 @@ pub struct Fm2Osc {
     feedback_mode: Fm2FeedbackMode,
     unison_voices: usize,
     unison_detune: f32,
+    unison_spread: f32,
     voice_phases: Vec<(f32, f32)>,
     voice_feedback: Vec<f32>,
     voice_feedback_prev: Vec<f32>,
@@ -1282,6 +1354,7 @@ impl Fm2Osc {
             feedback_mode: Fm2FeedbackMode::Classic,
             unison_voices: 1,
             unison_detune: 0.0,
+            unison_spread: 1.0,
             voice_phases: vec![(0.0, 0.0)],
             voice_feedback: vec![0.0],
             voice_feedback_prev: vec![0.0],
@@ -1325,6 +1398,10 @@ impl Fm2Osc {
         self.voice_feedback_prev.resize(self.unison_voices, 0.0);
     }
 
+    pub fn set_unison_spread(&mut self, spread: f32) {
+        self.unison_spread = spread.clamp(0.0, 1.0);
+    }
+
     pub fn reset(&mut self) {
         self.carrier_phase = 0.0;
         self.modulator_phase = 0.0;
@@ -1348,20 +1425,19 @@ impl Fm2Osc {
     }
 
     pub fn generate(&mut self) -> (f32, f32) {
-        let mut sum = 0.0f32;
+        let mut sum_l = 0.0f32;
+        let mut sum_r = 0.0f32;
         let carrier_dt = self.freq_hz / self.sample_rate;
         let modulator_dt = carrier_dt * self.ratio + self.m12offset / self.sample_rate;
-        let detune_scale = self.unison_detune * 0.05;
         let m12phase = self.m12phase * 2.0 * PI;
+        let n = self.unison_voices;
+        // The legacy FM2 mix was mono; scale the equal-power gains by 2 so the
+        // loudness matches the old mono sum while gaining a stereo spread.
+        let pan_scale = if n > 1 { 2.0 } else { 0.0 };
 
-        for i in 0..self.unison_voices {
+        for i in 0..n {
             let (cp, mp) = &mut self.voice_phases[i];
-            let offset = if self.unison_voices > 1 {
-                (i as f32 / (self.unison_voices as f32 - 1.0) - 0.5) * 2.0 * detune_scale
-            } else {
-                0.0
-            };
-            let detune_mul = 2.0f32.powf(offset / 12.0);
+            let detune_mul = unison::detune_ratio(i, n, self.unison_detune);
 
             let fb = match self.feedback_mode {
                 Fm2FeedbackMode::Classic => self.voice_feedback[i] * self.feedback * 2.0 * PI,
@@ -1390,11 +1466,18 @@ impl Fm2Osc {
                 *mp -= 1.0;
             }
 
-            sum += out;
+            if n > 1 {
+                let (pan_l, pan_r) = unison::pan_gains(i, n, self.unison_spread);
+                sum_l += out * pan_l * pan_scale;
+                sum_r += out * pan_r * pan_scale;
+            } else {
+                sum_l += out;
+                sum_r += out;
+            }
         }
 
-        let atten = 1.0 / (self.unison_voices as f32).sqrt();
-        (sum * atten, sum * atten)
+        let atten = 1.0 / (n as f32).sqrt();
+        (sum_l * atten, sum_r * atten)
     }
 }
 
@@ -1428,6 +1511,7 @@ pub struct Fm3Osc {
     feedback_mode: Fm3FeedbackMode,
     unison_voices: usize,
     unison_detune: f32,
+    unison_spread: f32,
     voice_phases: Vec<[f32; 3]>,
     voice_feedback: Vec<f32>,
     voice_feedback_prev: Vec<f32>,
@@ -1449,6 +1533,7 @@ impl Fm3Osc {
             feedback_mode: Fm3FeedbackMode::Classic,
             unison_voices: 1,
             unison_detune: 0.0,
+            unison_spread: 1.0,
             voice_phases: vec![[0.0; 3]],
             voice_feedback: vec![0.0],
             voice_feedback_prev: vec![0.0],
@@ -1501,6 +1586,10 @@ impl Fm3Osc {
         self.voice_feedback_prev.resize(self.unison_voices, 0.0);
     }
 
+    pub fn set_unison_spread(&mut self, spread: f32) {
+        self.unison_spread = spread.clamp(0.0, 1.0);
+    }
+
     pub fn reset(&mut self) {
         self.phases = [0.0; 3];
         for vp in &mut self.voice_phases {
@@ -1520,18 +1609,16 @@ impl Fm3Osc {
     }
 
     pub fn generate(&mut self) -> (f32, f32) {
-        let mut sum = 0.0f32;
+        let mut sum_l = 0.0f32;
+        let mut sum_r = 0.0f32;
         let base_dt = self.freq_hz / self.sample_rate;
-        let detune_scale = self.unison_detune * 0.05;
+        let n = self.unison_voices;
+        // The legacy FM3 mix was mono; scale the equal-power gains by 2 so the
+        // loudness matches the old mono sum while gaining a stereo spread.
+        let pan_scale = if n > 1 { 2.0 } else { 0.0 };
 
-        for i in 0..self.unison_voices {
-            let detune_mul = if self.unison_voices > 1 {
-                let offset =
-                    (i as f32 / (self.unison_voices as f32 - 1.0) - 0.5) * 2.0 * detune_scale;
-                2.0f32.powf(offset / 12.0)
-            } else {
-                1.0
-            };
+        for i in 0..n {
+            let detune_mul = unison::detune_ratio(i, n, self.unison_detune);
 
             let vp = &mut self.voice_phases[i];
             let dt1 = base_dt * detune_mul;
@@ -1591,11 +1678,18 @@ impl Fm3Osc {
                 vp[2] -= 1.0;
             }
 
-            sum += out;
+            if n > 1 {
+                let (pan_l, pan_r) = unison::pan_gains(i, n, self.unison_spread);
+                sum_l += out * pan_l * pan_scale;
+                sum_r += out * pan_r * pan_scale;
+            } else {
+                sum_l += out;
+                sum_r += out;
+            }
         }
 
-        let atten = 1.0 / (self.unison_voices as f32).sqrt();
-        (sum * atten, sum * atten)
+        let atten = 1.0 / (n as f32).sqrt();
+        (sum_l * atten, sum_r * atten)
     }
 }
 
@@ -1612,10 +1706,11 @@ pub struct WavetableOsc {
     keytrack: f32,
     unison_voices: usize,
     unison_detune: f32,
+    unison_spread: f32,
     voice_phases: Vec<f32>,
     sampler_mode: u8,
     sample_position: f32,
-    pub wavetable: Option<Box<Wavetable>>,
+    pub wavetable: Option<Arc<Wavetable>>,
 }
 
 impl WavetableOsc {
@@ -1632,6 +1727,7 @@ impl WavetableOsc {
             keytrack: 0.0,
             unison_voices: 1,
             unison_detune: 0.0,
+            unison_spread: 1.0,
             voice_phases: vec![0.0],
             sampler_mode: 0,
             sample_position: 0.0,
@@ -1681,6 +1777,10 @@ impl WavetableOsc {
             .resize_with(self.unison_voices, rand::random::<f32>);
     }
 
+    pub fn set_unison_spread(&mut self, spread: f32) {
+        self.unison_spread = spread.clamp(0.0, 1.0);
+    }
+
     pub fn reset(&mut self) {
         self.phase = 0.0;
         for vp in &mut self.voice_phases {
@@ -1712,23 +1812,18 @@ impl WavetableOsc {
         let mut sum_l = 0.0f32;
         let mut sum_r = 0.0f32;
         let base_inc = self.freq_hz / self.sample_rate;
-        let detune_scale = self.unison_detune * 0.05;
         let fm_shift = fm_input * 0.05;
+        let n = self.unison_voices;
 
-        let mipmap = wt.select_mipmap(base_inc);
+        let mipmap = wt.select_mipmap(base_inc * self.formant.max(1.0));
 
         let max_frame = (wt.n_tables.saturating_sub(1)) as f32;
         let base_morph = self.shape * max_frame;
         let keytrack_offset = self.keytrack * (self.freq_hz / 440.0).log2() * max_frame * 0.5;
         let morph_pos = (base_morph + keytrack_offset).clamp(0.0, max_frame * 0.99999);
 
-        for i in 0..self.unison_voices {
-            let offset = if self.unison_voices > 1 {
-                (i as f32 / (self.unison_voices as f32 - 1.0) - 0.5) * 2.0 * detune_scale
-            } else {
-                0.0
-            };
-            let detune_mul = 2.0f32.powf(offset / 12.0);
+        for i in 0..n {
+            let detune_mul = unison::detune_ratio(i, n, self.unison_detune);
             let phase_inc = base_inc * detune_mul;
 
             let phase = self.voice_phases[i];
@@ -1769,16 +1864,12 @@ impl WavetableOsc {
                 self.voice_phases[i] -= 1.0;
             }
 
-            let pan = if self.unison_voices > 1 {
-                i as f32 / (self.unison_voices as f32 - 1.0)
-            } else {
-                0.5
-            };
-            sum_l += sample * (1.0 - pan);
-            sum_r += sample * pan;
+            let (pan_l, pan_r) = unison::pan_gains(i, n, self.unison_spread);
+            sum_l += sample * pan_l;
+            sum_r += sample * pan_r;
         }
 
-        let atten = 1.0 / (self.unison_voices as f32).sqrt();
+        let atten = 1.0 / (n as f32).sqrt();
         (sum_l * atten, sum_r * atten)
     }
 
@@ -1880,13 +1971,16 @@ pub struct WindowOsc {
     window_type: WindowType,
     lowcut: Filter,
     highcut: Filter,
+    lowcut_r: Filter,
+    highcut_r: Filter,
     lowcut_hz: f32,
     highcut_hz: f32,
     unison_voices: usize,
     unison_detune: f32,
+    unison_spread: f32,
     voice_phases: Vec<f32>,
-    pub wavetable: Option<Box<Wavetable>>,
-    pub window_wt: Option<Box<Wavetable>>,
+    pub wavetable: Option<Arc<Wavetable>>,
+    pub window_wt: Option<Arc<Wavetable>>,
 }
 
 impl WindowOsc {
@@ -1899,6 +1993,8 @@ impl WindowOsc {
         highcut.set_filter_type(FilterType::Lowpass12dB);
         highcut.set_params(20000.0, 0.7);
         highcut.prepare_block(20000.0, 0.7, 1);
+        let lowcut_r = lowcut.clone();
+        let highcut_r = highcut.clone();
         Self {
             sample_rate,
             freq_hz: 440.0,
@@ -1908,10 +2004,13 @@ impl WindowOsc {
             window_type: WindowType::Sine,
             lowcut,
             highcut,
+            lowcut_r,
+            highcut_r,
             lowcut_hz: 20.0,
             highcut_hz: 20000.0,
             unison_voices: 1,
             unison_detune: 0.0,
+            unison_spread: 1.0,
             voice_phases: vec![0.0],
             wavetable: None,
             window_wt: None,
@@ -1939,6 +2038,8 @@ impl WindowOsc {
         self.lowcut_hz = f;
         self.lowcut.set_params(f, 0.7);
         self.lowcut.prepare_block(f, 0.7, 1);
+        self.lowcut_r.set_params(f, 0.7);
+        self.lowcut_r.prepare_block(f, 0.7, 1);
     }
 
     pub fn set_highcut(&mut self, freq: f32) {
@@ -1946,6 +2047,8 @@ impl WindowOsc {
         self.highcut_hz = f;
         self.highcut.set_params(f, 0.7);
         self.highcut.prepare_block(f, 0.7, 1);
+        self.highcut_r.set_params(f, 0.7);
+        self.highcut_r.prepare_block(f, 0.7, 1);
     }
 
     pub fn set_unison(&mut self, voices: usize, detune: f32) {
@@ -1953,6 +2056,10 @@ impl WindowOsc {
         self.unison_detune = detune.clamp(0.0, 1.0);
         self.voice_phases
             .resize_with(self.unison_voices, rand::random::<f32>);
+    }
+
+    pub fn set_unison_spread(&mut self, spread: f32) {
+        self.unison_spread = spread.clamp(0.0, 1.0);
     }
 
     pub fn reset(&mut self) {
@@ -1977,22 +2084,20 @@ impl WindowOsc {
         let mut sum_l = 0.0f32;
         let mut sum_r = 0.0f32;
         let base_inc = self.freq_hz / self.sample_rate;
-        let detune_scale = self.unison_detune * 0.05;
         let fm_shift = fm_input * 0.05;
+        let n = self.unison_voices;
 
-        let mipmap = wt.select_mipmap(base_inc);
-        let win_mipmap = self.window_wt.as_ref().map(|w| w.select_mipmap(base_inc));
+        let mipmap = wt.select_mipmap(base_inc * self.formant.max(1.0));
+        let win_mipmap = self
+            .window_wt
+            .as_ref()
+            .map(|w| w.select_mipmap(base_inc * self.formant.max(1.0)));
 
         let max_frame = (wt.n_tables.saturating_sub(1)) as f32;
         let morph_pos = self.shape * max_frame * 0.99999;
 
-        for i in 0..self.unison_voices {
-            let offset = if self.unison_voices > 1 {
-                (i as f32 / (self.unison_voices as f32 - 1.0) - 0.5) * 2.0 * detune_scale
-            } else {
-                0.0
-            };
-            let detune_mul = 2.0f32.powf(offset / 12.0);
+        for i in 0..n {
+            let detune_mul = unison::detune_ratio(i, n, self.unison_detune);
             let phase_inc = base_inc * detune_mul;
 
             let phase = self.voice_phases[i];
@@ -2021,26 +2126,22 @@ impl WindowOsc {
                 self.voice_phases[i] -= 1.0;
             }
 
-            let pan = if self.unison_voices > 1 {
-                i as f32 / (self.unison_voices as f32 - 1.0)
-            } else {
-                0.5
-            };
-            sum_l += sample * (1.0 - pan);
-            sum_r += sample * pan;
+            let (pan_l, pan_r) = unison::pan_gains(i, n, self.unison_spread);
+            sum_l += sample * pan_l;
+            sum_r += sample * pan_r;
         }
 
-        let atten = 1.0 / (self.unison_voices as f32).sqrt();
+        let atten = 1.0 / (n as f32).sqrt();
 
         self.lowcut.prepare_block(self.lowcut_hz, 0.7, 1);
-        let mut lowcut_r = self.lowcut.clone();
+        self.lowcut_r.prepare_block(self.lowcut_hz, 0.7, 1);
         let out_l = self.lowcut.process(sum_l * atten);
-        let out_r = lowcut_r.process(sum_r * atten);
+        let out_r = self.lowcut_r.process(sum_r * atten);
 
         self.highcut.prepare_block(self.highcut_hz, 0.7, 1);
-        let mut highcut_r = self.highcut.clone();
+        self.highcut_r.prepare_block(self.highcut_hz, 0.7, 1);
         let out_l = self.highcut.process(out_l);
-        let out_r = highcut_r.process(out_r);
+        let out_r = self.highcut_r.process(out_r);
         (out_l, out_r)
     }
 }
@@ -2083,11 +2184,60 @@ pub struct ModernOsc {
     sub_waveform: ModernSubWaveform,
     sub_one: bool,
     phases: [f32; 8],
+    /// DPW (differentiated parabolic waveform) history: the previous two
+    /// parabolic-wave samples per voice. Kept in f64 — the second difference
+    /// cancels down to ~dt², which f32 cannot represent at low pitch.
+    dpw_state: [[f64; 2]; 8],
+}
+
+/// Surge-style Modern detune ladder: voice 0 (and the sub) at base pitch,
+/// voices 1..=3 sharpened by fractions of the detune range, voices 4..=6
+/// flattened symmetrically. `detune` is 0..=1 (×50 cents).
+#[inline]
+fn modern_detune_ladder(detune: f32) -> [f32; 8] {
+    let detune_cents = detune * 50.0;
+    [
+        0.0,
+        detune_cents * 0.25,
+        detune_cents * 0.5,
+        detune_cents * 0.75,
+        -detune_cents * 0.25,
+        -detune_cents * 0.5,
+        -detune_cents * 0.75,
+        0.0,
+    ]
+}
+
+/// Periodic double integral of the unit sawtooth `2t - 1`: its second
+/// derivative is exactly the sawtooth, so a discrete second difference of
+/// sampled `dpw_parabola` values (scaled by `1/dt²`) yields a band-limited
+/// saw (DPW). The parabola is chosen so both value and slope are continuous
+/// across the phase wrap.
+#[inline]
+fn dpw_parabola(phase: f32) -> f64 {
+    let p = (phase as f64).rem_euclid(1.0);
+    p * p * p / 3.0 - p * p / 2.0 + p / 6.0
+}
+
+/// Amplitude compensation for the discrete second-difference operator
+/// `x[n] - 2x[n-1] + x[n-2]`, whose frequency response is
+/// `4 sin²(ω/2)` instead of the continuous `ω²`. `dt` is the phase
+/// increment in cycles/sample; multiply the raw DPW output by this to
+/// restore the target spectrum (≈1 at low pitch, growing toward Nyquist).
+#[inline]
+pub(crate) fn dpw_droop_compensation(dt: f32) -> f32 {
+    let h = PI * dt;
+    if h < 1.0e-4 {
+        1.0
+    } else {
+        let sinc = h.sin() / h;
+        1.0 / (sinc * sinc)
+    }
 }
 
 impl ModernOsc {
     pub fn new(sample_rate: f32) -> Self {
-        Self {
+        let mut osc = Self {
             sample_rate,
             freq_hz: 440.0,
             detune: 0.2,
@@ -2097,11 +2247,18 @@ impl ModernOsc {
             sub_waveform: ModernSubWaveform::Square,
             sub_one: false,
             phases: [0.0; 8],
-        }
+            dpw_state: [[0.0; 2]; 8],
+        };
+        osc.rebuild_dpw_history();
+        osc
     }
 
     pub fn set_freq_hz(&mut self, freq: f32) {
         self.freq_hz = freq.max(0.1);
+        // The DPW history is indexed by phase; a frequency change alters the
+        // phase stride, so re-derive the history to avoid a one-sample spike
+        // (e.g. under portamento).
+        self.rebuild_dpw_history();
     }
 
     pub fn set_detune(&mut self, detune: f32) {
@@ -2135,10 +2292,26 @@ impl ModernOsc {
         for p in &mut self.phases {
             *p = rand::random();
         }
+        self.rebuild_dpw_history();
     }
 
     pub fn reset_to_zero(&mut self) {
         self.phases.fill(0.0);
+        self.rebuild_dpw_history();
+    }
+
+    /// Re-derive the two-sample DPW history for each voice from its current
+    /// phase and per-voice stride, so the next rendered sample continues the
+    /// parabola exactly (no click on note-on / pitch change).
+    fn rebuild_dpw_history(&mut self) {
+        let base_inc = self.freq_hz / self.sample_rate;
+        let detunes = modern_detune_ladder(self.detune);
+        for (i, &det) in detunes.iter().enumerate() {
+            let dt = base_inc * 2.0f32.powf(det / 1200.0);
+            let phase = self.phases[i];
+            self.dpw_state[i][0] = dpw_parabola(phase - dt);
+            self.dpw_state[i][1] = dpw_parabola(phase - 2.0 * dt);
+        }
     }
 
     pub fn generate(&mut self) -> (f32, f32) {
@@ -2146,26 +2319,23 @@ impl ModernOsc {
         let mut sum_l = 0.0f32;
         let mut sum_r = 0.0f32;
 
-        let detune_cents = self.detune * 50.0;
-        let detunes = [
-            0.0f32,
-            detune_cents * 0.25,
-            detune_cents * 0.5,
-            detune_cents * 0.75,
-            -detune_cents * 0.25,
-            -detune_cents * 0.5,
-            -detune_cents * 0.75,
-            0.0,
-        ];
+        let detunes = modern_detune_ladder(self.detune);
 
         for (i, detune) in detunes.iter().enumerate().take(7) {
             let dt = base_inc * 2.0f32.powf(*detune / 1200.0);
             let phase = self.phases[i];
-            let t = phase;
-            let vdt = dt;
 
-            let mut out = 2.0 * t - 1.0;
-            out -= poly_blep(t, vdt);
+            // DPW saw: the discrete second difference of the double
+            // integral `dpw_parabola`, scaled by 1/dt² and compensated for
+            // the second-difference droop. Per-voice `dt` keeps it exact for
+            // each voice's instantaneous frequency.
+            let p = dpw_parabola(phase);
+            let d = p - 2.0 * self.dpw_state[i][0] + self.dpw_state[i][1];
+            self.dpw_state[i][1] = self.dpw_state[i][0];
+            self.dpw_state[i][0] = p;
+            let dt64 = dt as f64;
+            let mut out = (d / (dt64 * dt64)) as f32;
+            out *= dpw_droop_compensation(dt);
             out = soft_clip(out);
 
             self.phases[i] += dt;
@@ -2229,11 +2399,14 @@ pub struct ShNoiseOsc {
     sync: f32,
     pub unison_voices: usize,
     pub unison_detune: f32,
+    unison_spread: f32,
     voice_phases: Vec<f32>,
     voice_values: Vec<f32>,
     voice_sync_phases: Vec<f32>,
     lowcut: Filter,
     highcut: Filter,
+    lowcut_r: Filter,
+    highcut_r: Filter,
     lowcut_hz: f32,
     highcut_hz: f32,
 }
@@ -2248,6 +2421,8 @@ impl ShNoiseOsc {
         highcut.set_filter_type(FilterType::Lowpass12dB);
         highcut.set_params(20000.0, 0.7);
         highcut.prepare_block(20000.0, 0.7, 1);
+        let lowcut_r = lowcut.clone();
+        let highcut_r = highcut.clone();
         Self {
             sample_rate,
             freq_hz: 440.0,
@@ -2258,11 +2433,14 @@ impl ShNoiseOsc {
             sync: 0.0,
             unison_voices: 1,
             unison_detune: 0.0,
+            unison_spread: 1.0,
             voice_phases: vec![0.0],
             voice_values: vec![0.0],
             voice_sync_phases: vec![0.0],
             lowcut,
             highcut,
+            lowcut_r,
+            highcut_r,
             lowcut_hz: 20.0,
             highcut_hz: 20000.0,
         }
@@ -2289,6 +2467,8 @@ impl ShNoiseOsc {
         self.lowcut_hz = f;
         self.lowcut.set_params(f, 0.7);
         self.lowcut.prepare_block(f, 0.7, 1);
+        self.lowcut_r.set_params(f, 0.7);
+        self.lowcut_r.prepare_block(f, 0.7, 1);
     }
 
     pub fn set_highcut(&mut self, freq: f32) {
@@ -2296,6 +2476,8 @@ impl ShNoiseOsc {
         self.highcut_hz = f;
         self.highcut.set_params(f, 0.7);
         self.highcut.prepare_block(f, 0.7, 1);
+        self.highcut_r.set_params(f, 0.7);
+        self.highcut_r.prepare_block(f, 0.7, 1);
     }
 
     pub fn set_unison(&mut self, voices: usize, detune: f32) {
@@ -2306,6 +2488,10 @@ impl ShNoiseOsc {
         self.voice_values
             .resize_with(self.unison_voices, || rand::random::<f32>() * 2.0 - 1.0);
         self.voice_sync_phases.resize(self.unison_voices, 0.0);
+    }
+
+    pub fn set_unison_spread(&mut self, spread: f32) {
+        self.unison_spread = spread.clamp(0.0, 1.0);
     }
 
     pub fn reset(&mut self) {
@@ -2328,17 +2514,12 @@ impl ShNoiseOsc {
 
     pub fn generate(&mut self) -> (f32, f32) {
         let base_inc = self.freq_hz / self.sample_rate;
-        let detune_scale = self.unison_detune * 0.05;
+        let n = self.unison_voices;
         let mut sum_l = 0.0f32;
         let mut sum_r = 0.0f32;
 
-        for i in 0..self.unison_voices {
-            let offset = if self.unison_voices > 1 {
-                (i as f32 / (self.unison_voices as f32 - 1.0) - 0.5) * 2.0 * detune_scale
-            } else {
-                0.0
-            };
-            let detune_mul = 2.0f32.powf(offset / 12.0);
+        for i in 0..n {
+            let detune_mul = unison::detune_ratio(i, n, self.unison_detune);
             let phase_inc = base_inc * detune_mul;
 
             if self.sync > 0.0 {
@@ -2360,26 +2541,22 @@ impl ShNoiseOsc {
                 self.voice_values[i] = corr * self.voice_values[i] + (1.0 - corr.abs()) * raw;
             }
 
-            let pan = if self.unison_voices > 1 {
-                i as f32 / (self.unison_voices as f32 - 1.0)
-            } else {
-                0.5
-            };
-            sum_l += self.voice_values[i] * (1.0 - pan);
-            sum_r += self.voice_values[i] * pan;
+            let (pan_l, pan_r) = unison::pan_gains(i, n, self.unison_spread);
+            sum_l += self.voice_values[i] * pan_l;
+            sum_r += self.voice_values[i] * pan_r;
         }
 
-        let atten = 1.0 / (self.unison_voices as f32).sqrt();
+        let atten = 1.0 / (n as f32).sqrt();
 
         self.lowcut.prepare_block(self.lowcut_hz, 0.7, 1);
-        let mut lowcut_r = self.lowcut.clone();
+        self.lowcut_r.prepare_block(self.lowcut_hz, 0.7, 1);
         let out_l = self.lowcut.process(sum_l * atten);
-        let out_r = lowcut_r.process(sum_r * atten);
+        let out_r = self.lowcut_r.process(sum_r * atten);
 
         self.highcut.prepare_block(self.highcut_hz, 0.7, 1);
-        let mut highcut_r = self.highcut.clone();
+        self.highcut_r.prepare_block(self.highcut_hz, 0.7, 1);
         let out_l = self.highcut.process(out_l);
-        let out_r = highcut_r.process(out_r);
+        let out_r = self.highcut_r.process(out_r);
         (out_l, out_r)
     }
 }
@@ -2429,6 +2606,72 @@ impl ExciterType {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct StringShelfBiquad {
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl StringShelfBiquad {
+    /// Direct-form-II-transposed-style biquad step: full independent
+    /// x[n-1], x[n-2], y[n-1], y[n-2] state (the previous implementation
+    /// reused one scalar for all four taps, which is not a biquad).
+    #[inline]
+    fn process(&mut self, x: f32, b0: f32, b1: f32, b2: f32, a1: f32, a2: f32) -> f32 {
+        let y = b0 * x + b1 * self.x1 + b2 * self.x2 - a1 * self.y1 - a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+/// RBJ shelving biquad coefficients (normalized to a0 = 1) with shelf slope
+/// S = 1, identical to the cookbook formulas used by `BiquadFilter`'s
+/// LowShelf/HighShelf arms. `gain` is the shelf linear amplitude.
+///
+/// The previous version replaced `cos(w0)` with 1.0, which does not merely
+/// approximate the shelf — it breaks its shape (the high shelf ended up with
+/// a DC gain of `gain^2`, i.e. +12 dB, instead of unity) and drove the
+/// Karplus feedback loop unstable.
+#[inline]
+fn shelf_coeffs(
+    gain: f32,
+    fc_hz: f32,
+    sample_rate: f32,
+    high_shelf: bool,
+) -> (f32, f32, f32, f32, f32) {
+    let a = gain;
+    let sqrt_a = a.sqrt();
+    let w0 = 2.0 * std::f32::consts::PI * (fc_hz / sample_rate).clamp(0.0001, 0.4999);
+    let cosw0 = w0.cos();
+    // S = 1: alpha = sin(w0)/2 * sqrt((A + 1/A)(1/S - 1) + 2) = sin(w0)/sqrt(2).
+    let alpha = w0.sin() * std::f32::consts::FRAC_1_SQRT_2;
+    let (b0, b1, b2, a0, a1, a2) = if high_shelf {
+        (
+            a * ((a + 1.0) + (a - 1.0) * cosw0 + 2.0 * sqrt_a * alpha),
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * cosw0),
+            a * ((a + 1.0) + (a - 1.0) * cosw0 - 2.0 * sqrt_a * alpha),
+            (a + 1.0) - (a - 1.0) * cosw0 + 2.0 * sqrt_a * alpha,
+            2.0 * ((a - 1.0) - (a + 1.0) * cosw0),
+            (a + 1.0) - (a - 1.0) * cosw0 - 2.0 * sqrt_a * alpha,
+        )
+    } else {
+        (
+            a * ((a + 1.0) - (a - 1.0) * cosw0 + 2.0 * sqrt_a * alpha),
+            2.0 * a * ((a - 1.0) - (a + 1.0) * cosw0),
+            a * ((a + 1.0) - (a - 1.0) * cosw0 - 2.0 * sqrt_a * alpha),
+            (a + 1.0) + (a - 1.0) * cosw0 + 2.0 * sqrt_a * alpha,
+            -2.0 * ((a - 1.0) + (a + 1.0) * cosw0),
+            (a + 1.0) + (a - 1.0) * cosw0 - 2.0 * sqrt_a * alpha,
+        )
+    };
+    (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+}
+
 #[derive(Debug, Clone)]
 pub struct StringOsc {
     sample_rate: f32,
@@ -2445,12 +2688,25 @@ pub struct StringOsc {
     prev_out2: f32,
     stiffness: f32,
     compliance: f32,
-    stiffness_state: f32,
-    stiffness_state2: f32,
+    /// Independent shelf-biquad state per string and per section, replacing
+    /// the single shared state variable: [0] string 1 stiffness (high shelf),
+    /// [1] string 1 compliance (low shelf), [2] string 2 stiffness,
+    /// [3] string 2 compliance.
+    stiffness_biquads: [StringShelfBiquad; 4],
     tone_lp: Filter,
     tone_hp: Filter,
+    tone_lp_r: Filter,
+    tone_hp_r: Filter,
     tone_lp2: Filter,
     tone_hp2: Filter,
+    tone_lp2_r: Filter,
+    tone_hp2_r: Filter,
+    /// Remembered tone-filter targets so generate() can re-prepare the
+    /// coefficient smoothing every block (BiquadFilter integrates its
+    /// smoothing deltas on every process call; preparing only on param
+    /// change lets the coefficients drift without bound).
+    tone_lp_hz: f32,
+    tone_hp_hz: f32,
     dual_detune: f32,
     dual_decay: f32,
     oversample: bool,
@@ -2474,12 +2730,17 @@ impl StringOsc {
             prev_out2: 0.0,
             stiffness: 0.0,
             compliance: 0.0,
-            stiffness_state: 0.0,
-            stiffness_state2: 0.0,
+            stiffness_biquads: [StringShelfBiquad::default(); 4],
             tone_lp: Filter::new(FilterType::Lowpass12dB, sample_rate),
             tone_hp: Filter::new(FilterType::Highpass12dB, sample_rate),
+            tone_lp_r: Filter::new(FilterType::Lowpass12dB, sample_rate),
+            tone_hp_r: Filter::new(FilterType::Highpass12dB, sample_rate),
             tone_lp2: Filter::new(FilterType::Lowpass12dB, sample_rate),
             tone_hp2: Filter::new(FilterType::Highpass12dB, sample_rate),
+            tone_lp2_r: Filter::new(FilterType::Lowpass12dB, sample_rate),
+            tone_hp2_r: Filter::new(FilterType::Highpass12dB, sample_rate),
+            tone_lp_hz: 20000.0,
+            tone_hp_hz: 20.0,
             dual_detune: 0.0,
             dual_decay: 0.5,
             oversample: false,
@@ -2520,18 +2781,28 @@ impl StringOsc {
 
     pub fn set_tone_lp(&mut self, freq: f32) {
         let f = freq.clamp(20.0, 20000.0);
+        self.tone_lp_hz = f;
         self.tone_lp.set_params(f, 0.7);
         self.tone_lp.prepare_block(f, 0.7, 1);
+        self.tone_lp_r.set_params(f, 0.7);
+        self.tone_lp_r.prepare_block(f, 0.7, 1);
         self.tone_lp2.set_params(f, 0.7);
         self.tone_lp2.prepare_block(f, 0.7, 1);
+        self.tone_lp2_r.set_params(f, 0.7);
+        self.tone_lp2_r.prepare_block(f, 0.7, 1);
     }
 
     pub fn set_tone_hp(&mut self, freq: f32) {
         let f = freq.clamp(20.0, 20000.0);
+        self.tone_hp_hz = f;
         self.tone_hp.set_params(f, 0.7);
         self.tone_hp.prepare_block(f, 0.7, 1);
+        self.tone_hp_r.set_params(f, 0.7);
+        self.tone_hp_r.prepare_block(f, 0.7, 1);
         self.tone_hp2.set_params(f, 0.7);
         self.tone_hp2.prepare_block(f, 0.7, 1);
+        self.tone_hp2_r.set_params(f, 0.7);
+        self.tone_hp2_r.prepare_block(f, 0.7, 1);
     }
 
     pub fn set_dual_detune(&mut self, detune: f32) {
@@ -2719,26 +2990,65 @@ impl StringOsc {
                 self.buffer.fill(0.0);
             }
         }
-        self.buffer2.copy_from_slice(&self.buffer);
+        // Position the write head one read-offset into the buffer so the
+        // first reads land on the freshly excited region. The read head sits
+        // `offset` samples behind the write head, which means every buffer
+        // slot is overwritten exactly `offset` samples before it would be
+        // read — so an excitation placed at the old write head (offset 0,
+        // e.g. pluck/hammer bursts) is clobbered before the read head ever
+        // reaches it and the string renders silence. Only the `offset`
+        // samples preceding the write head seed the loop.
+        let offset = (self.sample_rate / self.freq_hz * (1.0 - self.pickup_pos)) as usize;
+        self.write_pos = offset % self.buffer.len();
+        let freq2 = self.freq_hz * 2.0f32.powf(self.dual_detune / 12.0);
+        let offset2 = (self.sample_rate / freq2.max(20.0) * (1.0 - self.pickup_pos)) as usize;
+        self.write_pos2 = offset2 % self.buffer2.len();
         self.prev_out = 0.0;
         self.prev_out2 = 0.0;
-        self.stiffness_state = 0.0;
-        self.stiffness_state2 = 0.0;
+        self.stiffness_biquads = [StringShelfBiquad::default(); 4];
+        self.reset_tone_filters();
     }
 
     pub fn reset_to_zero(&mut self) {
-        self.buffer.fill(0.0);
-        self.buffer2.fill(0.0);
-        self.prev_out = 0.0;
-        self.prev_out2 = 0.0;
+        // A zero-filled delay line can only output silence, so unlike the
+        // periodic oscillators (where "zero phase" gives a deterministic
+        // start) the string must always be excited — delegate to reset().
+        self.reset();
+    }
+
+    fn reset_tone_filters(&mut self) {
+        self.tone_lp.reset();
+        self.tone_hp.reset();
+        self.tone_lp_r.reset();
+        self.tone_hp_r.reset();
+        self.tone_lp2.reset();
+        self.tone_hp2.reset();
+        self.tone_lp2_r.reset();
+        self.tone_hp2_r.reset();
     }
 
     pub fn generate(&mut self) -> (f32, f32) {
         let os_factor = if self.oversample { 2.0 } else { 1.0 };
+        let os_iters = os_factor as usize;
         let mut acc_l = 0.0;
         let mut acc_r = 0.0;
 
-        for _ in 0..os_factor as usize {
+        // BiquadFilter integrates its coefficient-smoothing deltas on every
+        // process call, so it must be re-prepared per block with the number
+        // of process calls in that block — otherwise the coefficients drift
+        // without bound. generate() processes os_iters samples per call.
+        self.tone_lp.prepare_block(self.tone_lp_hz, 0.7, os_iters);
+        self.tone_hp.prepare_block(self.tone_hp_hz, 0.7, os_iters);
+        self.tone_lp_r.prepare_block(self.tone_lp_hz, 0.7, os_iters);
+        self.tone_hp_r.prepare_block(self.tone_hp_hz, 0.7, os_iters);
+        self.tone_lp2.prepare_block(self.tone_lp_hz, 0.7, os_iters);
+        self.tone_hp2.prepare_block(self.tone_hp_hz, 0.7, os_iters);
+        self.tone_lp2_r
+            .prepare_block(self.tone_lp_hz, 0.7, os_iters);
+        self.tone_hp2_r
+            .prepare_block(self.tone_hp_hz, 0.7, os_iters);
+
+        for _ in 0..os_iters {
             let delay_samples = self.sample_rate * os_factor / self.freq_hz;
             let read_offset_l = delay_samples * (1.0 - self.pickup_pos);
             let read_offset_r = delay_samples * (1.0 - self.pickup_pos + self.stereo_spread * 0.1);
@@ -2757,56 +3067,31 @@ impl StringOsc {
             if self.stiffness > 0.0 || self.compliance > 0.0 {
                 let sr = self.sample_rate * os_factor;
                 let fc = (self.freq_hz * 2.0).clamp(100.0, sr * 0.45);
-                let omega = (std::f32::consts::PI * fc / sr).tan();
                 if self.stiffness > 0.0 {
-                    let a = 10.0f32.powf(self.stiffness * 6.0 / 20.0);
-                    let sqrt_a = a.sqrt();
-                    let b0 = a * ((a + 1.0) + (a - 1.0) * 1.0 + 2.0 * sqrt_a * omega);
-                    let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * 1.0);
-                    let b2 = a * ((a + 1.0) + (a - 1.0) * 1.0 - 2.0 * sqrt_a * omega);
-                    let a0 = (a + 1.0) - (a - 1.0) * 1.0 + 2.0 * sqrt_a * omega;
-                    let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * 1.0);
-                    let a2 = (a + 1.0) - (a - 1.0) * 1.0 - 2.0 * sqrt_a * omega;
-                    let b0 = b0 / a0;
-                    let b1 = b1 / a0;
-                    let b2 = b2 / a0;
-                    let a1 = a1 / a0;
-                    let a2 = a2 / a0;
-                    let new_out = b0 * out1 + b1 * self.stiffness_state + b2 * self.stiffness_state
-                        - a1 * self.stiffness_state
-                        - a2 * self.stiffness_state;
-                    self.stiffness_state = out1;
-                    out1 = new_out;
+                    // RBJ convention: A = 10^(dB/40) and the shelf amplitude
+                    // is A^2, so 3/20 gives the intended +-6 dB plateau.
+                    let (b0, b1, b2, a1, a2) =
+                        shelf_coeffs(10.0f32.powf(self.stiffness * 3.0 / 20.0), fc, sr, true);
+                    out1 = self.stiffness_biquads[0].process(out1, b0, b1, b2, a1, a2);
                 }
                 if self.compliance > 0.0 {
-                    let a = 10.0f32.powf(-self.compliance * 6.0 / 20.0);
-                    let sqrt_a = a.sqrt();
-                    let b0 = a * ((a + 1.0) - (a - 1.0) * 1.0 + 2.0 * sqrt_a * omega);
-                    let b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * 1.0);
-                    let b2 = a * ((a + 1.0) + (a - 1.0) * 1.0 - 2.0 * sqrt_a * omega);
-                    let a0 = (a + 1.0) + (a - 1.0) * 1.0 + 2.0 * sqrt_a * omega;
-                    let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * 1.0);
-                    let a2 = (a + 1.0) + (a - 1.0) * 1.0 - 2.0 * sqrt_a * omega;
-                    let b0 = b0 / a0;
-                    let b1 = b1 / a0;
-                    let b2 = b2 / a0;
-                    let a1 = a1 / a0;
-                    let a2 = a2 / a0;
-                    let new_out = b0 * out1 + b1 * self.stiffness_state + b2 * self.stiffness_state
-                        - a1 * self.stiffness_state
-                        - a2 * self.stiffness_state;
-                    self.stiffness_state = out1;
-                    out1 = new_out;
+                    let (b0, b1, b2, a1, a2) =
+                        shelf_coeffs(10.0f32.powf(-self.compliance * 3.0 / 20.0), fc, sr, false);
+                    out1 = self.stiffness_biquads[1].process(out1, b0, b1, b2, a1, a2);
                 }
             }
-            out1 *= 0.995;
+            // Soft-clip the feedback: the stiffness shelf boosts harmonics
+            // above fc by up to +6 dB, which can push the loop gain above 1
+            // at high frequencies; tanh bounds the line at +-1 and saturates
+            // the excess into a stable self-oscillation (standard KS).
+            out1 = (out1 * 0.995).tanh();
             self.buffer[self.write_pos] = out1;
             self.write_pos = (self.write_pos + 1) % self.buffer.len();
 
             let out_l1 = self.tone_lp.process(delayed_l);
             let out_l1 = self.tone_hp.process(out_l1);
-            let out_r1 = self.tone_lp.process(delayed_r);
-            let out_r1 = self.tone_hp.process(out_r1);
+            let out_r1 = self.tone_lp_r.process(delayed_r);
+            let out_r1 = self.tone_hp_r.process(out_r1);
 
             let freq2 = self.freq_hz * 2.0f32.powf(self.dual_detune / 12.0);
             let delay_samples2 = self.sample_rate * os_factor / freq2.max(20.0);
@@ -2828,58 +3113,27 @@ impl StringOsc {
             if self.stiffness > 0.0 || self.compliance > 0.0 {
                 let sr = self.sample_rate * os_factor;
                 let fc = (freq2 * 2.0).clamp(100.0, sr * 0.45);
-                let omega = (std::f32::consts::PI * fc / sr).tan();
                 if self.stiffness > 0.0 {
-                    let a = 10.0f32.powf(self.stiffness * 6.0 / 20.0);
-                    let sqrt_a = a.sqrt();
-                    let b0 = a * ((a + 1.0) + (a - 1.0) * 1.0 + 2.0 * sqrt_a * omega);
-                    let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * 1.0);
-                    let b2 = a * ((a + 1.0) + (a - 1.0) * 1.0 - 2.0 * sqrt_a * omega);
-                    let a0 = (a + 1.0) - (a - 1.0) * 1.0 + 2.0 * sqrt_a * omega;
-                    let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * 1.0);
-                    let a2 = (a + 1.0) - (a - 1.0) * 1.0 - 2.0 * sqrt_a * omega;
-                    let b0 = b0 / a0;
-                    let b1 = b1 / a0;
-                    let b2 = b2 / a0;
-                    let a1 = a1 / a0;
-                    let a2 = a2 / a0;
-                    let new_out =
-                        b0 * out2 + b1 * self.stiffness_state2 + b2 * self.stiffness_state2
-                            - a1 * self.stiffness_state2
-                            - a2 * self.stiffness_state2;
-                    self.stiffness_state2 = out2;
-                    out2 = new_out;
+                    // RBJ convention: A = 10^(dB/40) and the shelf amplitude
+                    // is A^2, so 3/20 gives the intended +-6 dB plateau.
+                    let (b0, b1, b2, a1, a2) =
+                        shelf_coeffs(10.0f32.powf(self.stiffness * 3.0 / 20.0), fc, sr, true);
+                    out2 = self.stiffness_biquads[2].process(out2, b0, b1, b2, a1, a2);
                 }
                 if self.compliance > 0.0 {
-                    let a = 10.0f32.powf(-self.compliance * 6.0 / 20.0);
-                    let sqrt_a = a.sqrt();
-                    let b0 = a * ((a + 1.0) - (a - 1.0) * 1.0 + 2.0 * sqrt_a * omega);
-                    let b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * 1.0);
-                    let b2 = a * ((a + 1.0) + (a - 1.0) * 1.0 - 2.0 * sqrt_a * omega);
-                    let a0 = (a + 1.0) + (a - 1.0) * 1.0 + 2.0 * sqrt_a * omega;
-                    let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * 1.0);
-                    let a2 = (a + 1.0) + (a - 1.0) * 1.0 - 2.0 * sqrt_a * omega;
-                    let b0 = b0 / a0;
-                    let b1 = b1 / a0;
-                    let b2 = b2 / a0;
-                    let a1 = a1 / a0;
-                    let a2 = a2 / a0;
-                    let new_out =
-                        b0 * out2 + b1 * self.stiffness_state2 + b2 * self.stiffness_state2
-                            - a1 * self.stiffness_state2
-                            - a2 * self.stiffness_state2;
-                    self.stiffness_state2 = out2;
-                    out2 = new_out;
+                    let (b0, b1, b2, a1, a2) =
+                        shelf_coeffs(10.0f32.powf(-self.compliance * 3.0 / 20.0), fc, sr, false);
+                    out2 = self.stiffness_biquads[3].process(out2, b0, b1, b2, a1, a2);
                 }
             }
-            out2 *= 0.995;
+            out2 = (out2 * 0.995).tanh();
             self.buffer2[self.write_pos2] = out2;
             self.write_pos2 = (self.write_pos2 + 1) % self.buffer2.len();
 
             let out_l2 = self.tone_lp2.process(delayed_l2);
             let out_l2 = self.tone_hp2.process(out_l2);
-            let out_r2 = self.tone_lp2.process(delayed_r2);
-            let out_r2 = self.tone_hp2.process(out_r2);
+            let out_r2 = self.tone_lp2_r.process(delayed_r2);
+            let out_r2 = self.tone_hp2_r.process(out_r2);
 
             let mix2 = self.dual_detune * 0.5;
             let mix1 = 1.0 - mix2;
@@ -2981,6 +3235,7 @@ pub struct AliasOsc {
     hold_counter: usize,
     unison_voices: usize,
     unison_detune: f32,
+    unison_spread: f32,
     voice_phases: Vec<f32>,
     ring_buffer: [f32; 256],
     ring_pos: usize,
@@ -3004,6 +3259,7 @@ impl AliasOsc {
             hold_counter: 0,
             unison_voices: 1,
             unison_detune: 0.0,
+            unison_spread: 1.0,
             voice_phases: vec![0.0],
             ring_buffer: [0.0f32; 256],
             ring_pos: 0,
@@ -3051,6 +3307,10 @@ impl AliasOsc {
         self.unison_detune = detune.clamp(0.0, 1.0);
         self.voice_phases
             .resize_with(self.unison_voices, rand::random);
+    }
+
+    pub fn set_unison_spread(&mut self, spread: f32) {
+        self.unison_spread = spread.clamp(0.0, 1.0);
     }
 
     pub fn set_partial_amplitude(&mut self, index: usize, amplitude: f32) {
@@ -3158,20 +3418,15 @@ impl AliasOsc {
 
     pub fn generate(&mut self) -> (f32, f32) {
         let base_inc = self.freq_hz / self.sample_rate;
-        let detune_scale = self.unison_detune * 0.05;
+        let n = self.unison_voices;
         let mut sum_l = 0.0f32;
         let mut sum_r = 0.0f32;
 
         let levels = 2.0f32.powf(self.quant_bits - 1.0);
         let hold_every = self.decim_factor as usize;
 
-        for i in 0..self.unison_voices {
-            let offset = if self.unison_voices > 1 {
-                (i as f32 / (self.unison_voices as f32 - 1.0) - 0.5) * 2.0 * detune_scale
-            } else {
-                0.0
-            };
-            let detune_mul = 2.0f32.powf(offset / 12.0);
+        for i in 0..n {
+            let detune_mul = unison::detune_ratio(i, n, self.unison_detune);
             let phase_inc = base_inc * detune_mul;
 
             self.voice_phases[i] += phase_inc;
@@ -3220,22 +3475,18 @@ impl AliasOsc {
                 out = 0.0;
             }
 
-            let pan = if self.unison_voices > 1 {
-                i as f32 / (self.unison_voices as f32 - 1.0)
-            } else {
-                0.5
-            };
-            sum_l += out * (1.0 - pan);
-            sum_r += out * pan;
+            let (pan_l, pan_r) = unison::pan_gains(i, n, self.unison_spread);
+            sum_l += out * pan_l;
+            sum_r += out * pan_r;
         }
 
         if self.waveform == AliasWaveform::AliasMem {
-            let mono = (sum_l + sum_r) * 0.5 / (self.unison_voices as f32).sqrt();
+            let mono = (sum_l + sum_r) * 0.5 / (n as f32).sqrt();
             self.ring_buffer[self.ring_pos] = mono;
             self.ring_pos = (self.ring_pos + 1) & 0xFF;
         }
 
-        let atten = 1.0 / (self.unison_voices as f32).sqrt();
+        let atten = 1.0 / (n as f32).sqrt();
         (sum_l * atten, sum_r * atten)
     }
 }
@@ -3424,7 +3675,7 @@ pub enum Oscillator {
     Window(WindowOsc),
     Modern(ModernOsc),
     ShNoise(ShNoiseOsc),
-    String(StringOsc),
+    String(Box<StringOsc>),
     Alias(Box<AliasOsc>),
     Twist(TwistOsc),
     AudioInput(AudioInputOsc),
@@ -3442,7 +3693,7 @@ impl Oscillator {
             OscType::Window => Oscillator::Window(WindowOsc::new(sample_rate)),
             OscType::Modern => Oscillator::Modern(ModernOsc::new(sample_rate)),
             OscType::ShNoise => Oscillator::ShNoise(ShNoiseOsc::new(sample_rate)),
-            OscType::String => Oscillator::String(StringOsc::new(sample_rate)),
+            OscType::String => Oscillator::String(Box::new(StringOsc::new(sample_rate))),
             OscType::Alias => Oscillator::Alias(Box::new(AliasOsc::new(sample_rate))),
             OscType::Twist => Oscillator::Twist(TwistOsc::new(sample_rate)),
             OscType::AudioInput => Oscillator::AudioInput(AudioInputOsc::new(sample_rate)),
@@ -3483,6 +3734,63 @@ impl Oscillator {
             Oscillator::Twist(o) => o.set_freq_hz(freq),
             Oscillator::AudioInput(o) => o.set_freq_hz(freq),
             Oscillator::Sample(o) => o.set_freq_hz(freq),
+        }
+    }
+
+    /// Re-target the oscillator at a new host sample rate. Internal filters
+    /// and delay-line capacity follow; oscillator state (phase, string
+    /// excitation) is preserved where possible. `SampleOsc` is skipped: its
+    /// rate is the loaded buffer's rate, managed by `set_buffer`.
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        let sr = sample_rate.max(1.0);
+        match self {
+            Oscillator::Classic(o) => o.sample_rate = sr,
+            Oscillator::Sine(o) => {
+                o.sample_rate = sr;
+                o.lowcut.set_sample_rate(sr);
+                o.highcut.set_sample_rate(sr);
+                o.lowcut_r.set_sample_rate(sr);
+                o.highcut_r.set_sample_rate(sr);
+            }
+            Oscillator::Fm2(o) => o.sample_rate = sr,
+            Oscillator::Fm3(o) => o.sample_rate = sr,
+            Oscillator::Wavetable(o) => o.sample_rate = sr,
+            Oscillator::Window(o) => {
+                o.sample_rate = sr;
+                o.lowcut.set_sample_rate(sr);
+                o.highcut.set_sample_rate(sr);
+                o.lowcut_r.set_sample_rate(sr);
+                o.highcut_r.set_sample_rate(sr);
+            }
+            Oscillator::Modern(o) => o.sample_rate = sr,
+            Oscillator::ShNoise(o) => {
+                o.sample_rate = sr;
+                o.lowcut.set_sample_rate(sr);
+                o.highcut.set_sample_rate(sr);
+                o.lowcut_r.set_sample_rate(sr);
+                o.highcut_r.set_sample_rate(sr);
+            }
+            Oscillator::String(o) => {
+                o.sample_rate = sr;
+                o.tone_lp.set_sample_rate(sr);
+                o.tone_hp.set_sample_rate(sr);
+                o.tone_lp_r.set_sample_rate(sr);
+                o.tone_hp_r.set_sample_rate(sr);
+                o.tone_lp2.set_sample_rate(sr);
+                o.tone_hp2.set_sample_rate(sr);
+                o.tone_lp2_r.set_sample_rate(sr);
+                o.tone_hp2_r.set_sample_rate(sr);
+                let max_size = ((sr * 2.0) / 20.0) as usize + 4;
+                if o.buffer.len() != max_size {
+                    o.buffer.resize(max_size, 0.0);
+                    o.buffer2.resize(max_size, 0.0);
+                    o.reset();
+                }
+            }
+            Oscillator::Alias(o) => o.sample_rate = sr,
+            Oscillator::Twist(o) => o.set_sample_rate(sr),
+            Oscillator::AudioInput(o) => o.sample_rate = sr,
+            Oscillator::Sample(_) => {}
         }
     }
 
@@ -3571,8 +3879,20 @@ impl Oscillator {
     }
 
     pub fn set_unison_spread(&mut self, spread: f32) {
-        if let Oscillator::Classic(o) = self {
-            o.set_unison_spread(spread)
+        match self {
+            Oscillator::Classic(o) => o.set_unison_spread(spread),
+            Oscillator::Sine(o) => o.set_unison_spread(spread),
+            Oscillator::Fm2(o) => o.set_unison_spread(spread),
+            Oscillator::Fm3(o) => o.set_unison_spread(spread),
+            Oscillator::Wavetable(o) => o.set_unison_spread(spread),
+            Oscillator::Window(o) => o.set_unison_spread(spread),
+            Oscillator::ShNoise(o) => o.set_unison_spread(spread),
+            Oscillator::Alias(o) => o.set_unison_spread(spread),
+            Oscillator::Twist(o) => o.set_unison_spread(spread),
+            Oscillator::Modern(_o) => {}
+            Oscillator::String(_o) => {}
+            Oscillator::AudioInput(_o) => {}
+            Oscillator::Sample(_o) => {}
         }
     }
 
@@ -3588,7 +3908,7 @@ impl Oscillator {
             Oscillator::String(o) => o.set_damping(shape),
             Oscillator::Alias(o) => o.set_quant_bits(shape * 15.0 + 1.0),
             Oscillator::Twist(o) => o.set_model(crate::common::twist::TwistModel::from_u8(
-                (shape * 5.0) as u8,
+                ((shape.clamp(0.0, 1.0) * 16.0) as u8).min(15),
             )),
             Oscillator::ShNoise(_o) => {}
             Oscillator::AudioInput(o) => o.set_gain(shape * 4.0),
@@ -3777,6 +4097,14 @@ impl Oscillator {
     pub fn set_sampler_mode(&mut self, mode: u8) {
         if let Oscillator::Wavetable(o) = self {
             o.set_sampler_mode(mode)
+        }
+    }
+
+    pub fn set_wavetable(&mut self, wavetable: Option<Arc<Wavetable>>) {
+        match self {
+            Oscillator::Wavetable(o) => o.wavetable = wavetable,
+            Oscillator::Window(o) => o.wavetable = wavetable,
+            _ => {}
         }
     }
 

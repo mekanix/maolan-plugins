@@ -12,8 +12,16 @@ use super::{
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+use crate::common::halfband::{HalfbandDownsampler, HalfbandUpsampler};
+use crate::common::wavetable::Wavetable;
+
 const OSC1_ONLY_BYPASS: bool = false;
 const NOTE_ON_DECLICK_SAMPLES: usize = 64;
+
+/// Duration of the "uber release" fade applied to a stolen voice: fast
+/// enough to free the voice almost immediately, slow enough to avoid a click
+/// at the note cut (Surge's uber-release concept).
+const UBER_RELEASE_SECONDS: f32 = 0.005;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OscPhaseMode {
@@ -81,6 +89,7 @@ pub struct OscSettings {
     pub route: OscRoute,
     pub mute: bool,
     pub solo: bool,
+    pub wavetable_select: u8,
 }
 
 impl Default for OscSettings {
@@ -135,6 +144,7 @@ impl Default for OscSettings {
             route: OscRoute::Both,
             mute: false,
             solo: false,
+            wavetable_select: 0,
         }
     }
 }
@@ -738,8 +748,40 @@ fn mod_depth_target_index(target: ModTarget) -> Option<usize> {
     }
 }
 
-fn cutoff_mod_hz(mod_value: f32) -> f32 {
-    mod_value * 10000.0
+/// Full-scale range of a mod-matrix route into a filter cutoff, in
+/// semitones. Mod sources are bipolar (−1..=1) and route depths clamp to
+/// −1..=1, so a fully-open route swings the cutoff by ±5 octaves — the same
+/// span the voice LFOs use (see `filter_cutoff_hz`).
+fn cutoff_mod_semitones(mod_value: f32) -> f32 {
+    mod_value * 60.0
+}
+
+/// Filter cutoff modulation in octave space, after Surge: every modulator
+/// contributes semitones and the total shifts the base cutoff
+/// multiplicatively (`base * 2^(semi/12)`), so sweeps are equally musical at
+/// any base cutoff. Calibrations (full-scale semitone ranges):
+/// - filter EG: `eg_amount` −1..=1 at a fully-open EG (output 1) ⇒ ±96 st
+///   (±8 octaves)
+/// - voice LFO: full LFO output ⇒ ±60 st (±5 octaves)
+/// - key tracking: `key_tracking` 0..=1 ⇒ 0..=12 st per key away from note 60
+///   (negative below it)
+/// - mod-matrix routes: bipolar ±1 ⇒ ±60 st (±5 octaves, `cutoff_mod_semitones`)
+///
+/// The result is clamped to 20..20000 Hz, as the old additive-Hz code did.
+fn filter_cutoff_hz(
+    base: f32,
+    eg_output: f32,
+    eg_amount: f32,
+    lfo_output: f32,
+    key_tracking: f32,
+    note: u8,
+    mod_cutoff_semitones: f32,
+) -> f32 {
+    let semitones = eg_output * eg_amount * 96.0
+        + lfo_output * 60.0
+        + key_tracking * (note as f32 - 60.0) * 12.0
+        + mod_cutoff_semitones;
+    (base * 2.0f32.powf(semitones / 12.0)).clamp(20.0, 20000.0)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -804,6 +846,28 @@ pub struct ModValues {
     osc_fm_depth: f32,
     osc_sync: [f32; 3],
     mod_depth: [f32; 12],
+}
+
+/// Block-/sample-constant switch state for the nonlinear filter section,
+/// bundled so the per-sample entry point stays small.
+#[derive(Debug, Clone, Copy)]
+struct VoiceFilterContext {
+    balance: f32,
+    ws_active: bool,
+    f1_enabled: bool,
+    f2_enabled: bool,
+    per_source_routing: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VoiceFilterSampleParams {
+    f1_cutoff: f32,
+    f1_res: f32,
+    f1_drive: f32,
+    f2_cutoff: f32,
+    f2_res: f32,
+    f2_drive: f32,
+    ws_drive: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -900,6 +964,7 @@ pub struct VoiceParams {
     pub twist_lpg_decay: f32,
     pub mono_pedal_mode: bool,
     pub lowcut_slope: u8,
+    pub voice_oversample: bool,
 }
 
 impl Default for VoiceParams {
@@ -1004,6 +1069,7 @@ impl Default for VoiceParams {
             twist_lpg_decay: 0.0,
             mono_pedal_mode: false,
             lowcut_slope: 1,
+            voice_oversample: true,
             tuning_scale: 0,
             tuning_root: 60,
             tuning_override: None,
@@ -1015,6 +1081,7 @@ impl Default for VoiceParams {
 pub struct Voice {
     sample_rate: f32,
     oscillators: [Oscillator; 3],
+    wavetables: [Option<Arc<Wavetable>>; 3],
     noise: NoiseGenerator,
     flavor: FlavorFilter,
     flavor2: FlavorFilter,
@@ -1074,6 +1141,10 @@ pub struct Voice {
     alternate_sign: f32,
     note_counter: usize,
     note_on_fade_counter: usize,
+    /// Set when the voice is stolen: the old note fades out over
+    /// `UBER_RELEASE_SECONDS` while a new voice takes the note.
+    uber_release: bool,
+    uber_fade: f32,
 
     drift_phase: [f32; 3],
     drift_target: [f32; 3],
@@ -1081,6 +1152,18 @@ pub struct Voice {
     pitch_bend_smooth_state: f32,
     filter_feedback_prev_l: f32,
     filter_feedback_prev_r: f32,
+    // 2×-rate halfband pair for the optional oversampled nonlinear filter
+    // section: [l, r, f2_l, f2_r] interpolators and [l, r] decimators. When
+    // idle they hold zeros and cost nothing per block.
+    os_up_l: HalfbandUpsampler,
+    os_up_r: HalfbandUpsampler,
+    os_up_f2_l: HalfbandUpsampler,
+    os_up_f2_r: HalfbandUpsampler,
+    os_down_l: HalfbandDownsampler,
+    os_down_r: HalfbandDownsampler,
+    // Sample rate the four voice filters are currently built for: host rate
+    // when the oversampled path is off, 2× host rate when it is on.
+    filter_sample_rate: f32,
     mts_esp: Option<Arc<Mutex<MtsEspClient>>>,
 }
 
@@ -1093,6 +1176,7 @@ impl Voice {
                 Oscillator::new(OscType::Sine, sample_rate),
                 Oscillator::new(OscType::Fm2, sample_rate),
             ],
+            wavetables: [None, None, None],
             noise: NoiseGenerator::new(sample_rate),
             flavor: FlavorFilter::new(sample_rate),
             flavor2: FlavorFilter::new(sample_rate),
@@ -1147,12 +1231,21 @@ impl Voice {
             alternate_sign: 1.0,
             note_counter: 0,
             note_on_fade_counter: 0,
+            uber_release: false,
+            uber_fade: 1.0,
             drift_phase: [0.0; 3],
             drift_target: [0.0; 3],
             drift_smooth: [0.0; 3],
             pitch_bend_smooth_state: 0.0,
             filter_feedback_prev_l: 0.0,
             filter_feedback_prev_r: 0.0,
+            os_up_l: HalfbandUpsampler::new(),
+            os_up_r: HalfbandUpsampler::new(),
+            os_up_f2_l: HalfbandUpsampler::new(),
+            os_up_f2_r: HalfbandUpsampler::new(),
+            os_down_l: HalfbandDownsampler::new(),
+            os_down_r: HalfbandDownsampler::new(),
+            filter_sample_rate: sample_rate,
             mts_esp: None,
         }
     }
@@ -1511,6 +1604,7 @@ impl Voice {
                 if osc.osc_type() != settings.osc_type {
                     *osc = Oscillator::new(settings.osc_type, self.sample_rate);
                 }
+                osc.set_wavetable(self.wavetables[idx].clone());
                 osc.set_shape(settings.shape);
                 osc.set_skew(settings.skew);
                 osc.set_formant(settings.formant);
@@ -1688,6 +1782,16 @@ impl Voice {
         self.params.filter_feedback = params.filter_feedback;
     }
 
+    /// Set the active wavetable for one oscillator (0..2), applied immediately
+    /// and re-applied whenever the oscillator is rebuilt.
+    pub fn set_wavetable(&mut self, osc_index: usize, wavetable: Option<Arc<Wavetable>>) {
+        if osc_index >= self.oscillators.len() {
+            return;
+        }
+        self.wavetables[osc_index] = wavetable;
+        self.oscillators[osc_index].set_wavetable(self.wavetables[osc_index].clone());
+    }
+
     pub fn update_osc_params(&mut self, params: &VoiceParams) {
         let old_oscs = self.params.oscs.clone();
         self.params.oscs = params.oscs.clone();
@@ -1707,6 +1811,7 @@ impl Voice {
             if osc_type_changed {
                 *osc = Oscillator::new(settings.osc_type, self.sample_rate);
             }
+            osc.set_wavetable(self.wavetables[idx].clone());
             if osc_type_changed || old_settings.shape != settings.shape {
                 osc.set_shape(settings.shape);
             }
@@ -2109,6 +2214,7 @@ impl Voice {
         self.params.sh_noise_correlation = params.sh_noise_correlation;
         self.params.sh_noise_width = params.sh_noise_width;
         self.params.sh_noise_sync = params.sh_noise_sync;
+        self.params.voice_oversample = params.voice_oversample;
     }
 
     pub fn set_mts_esp(&mut self, client: Option<Arc<Mutex<MtsEspClient>>>) {
@@ -2132,21 +2238,17 @@ impl Voice {
         self.lfo6.set_sample_rate(sample_rate);
         self.noise = NoiseGenerator::new(sample_rate);
         self.flavor.set_sample_rate(sample_rate);
+        self.filter_sample_rate = sample_rate;
+        self.reset_oversample_state();
+        for osc in &mut self.oscillators {
+            osc.set_sample_rate(sample_rate);
+        }
     }
 
     pub fn set_eg_tempo(&mut self, tempo_bpm: f32) {
         self.amp_eg.set_tempo(tempo_bpm);
         self.filter_eg.set_tempo(tempo_bpm);
         self.pitch_eg.set_tempo(tempo_bpm);
-    }
-
-    pub fn set_scene_lfo_outputs(&mut self, outputs: [f32; 6]) {
-        self.scene_lfo1_output = outputs[0];
-        self.scene_lfo2_output = outputs[1];
-        self.scene_lfo3_output = outputs[2];
-        self.scene_lfo4_output = outputs[3];
-        self.scene_lfo5_output = outputs[4];
-        self.scene_lfo6_output = outputs[5];
     }
 
     pub fn set_key_mod_values(&mut self, lowest: f32, highest: f32, latest: f32) {
@@ -2164,6 +2266,7 @@ impl Voice {
 
         self.filter_feedback_prev_l = 0.0;
         self.filter_feedback_prev_r = 0.0;
+        self.reset_oversample_state();
         self.target_freq = note_to_freq(note, &self.tuning, &self.mts_esp);
         let portamento_time = if self.params.portamento_sync && self.tempo_bpm > 0.0 {
             self.params.portamento * 60.0 / self.tempo_bpm
@@ -2207,6 +2310,27 @@ impl Voice {
             -1.0
         };
         self.note_on_fade_counter = NOTE_ON_DECLICK_SAMPLES;
+        self.uber_release = false;
+        self.uber_fade = 1.0;
+        // SYNTH.md P2 item 17: drift starts from a random offset (Surge's
+        // DriftLFO behavior) so consecutive notes don't begin identically
+        // detuned.
+        for idx in 0..3 {
+            self.drift_target[idx] = random::<f32>() * 2.0 - 1.0;
+            self.drift_phase[idx] = random::<f32>() * 2.0 - 1.0;
+            self.drift_smooth[idx] = 1.0;
+        }
+    }
+
+    /// "Uber release": the voice is being stolen. Drop the gate and fade the
+    /// output out very quickly; `active` clears once the fade reaches zero.
+    pub fn begin_uber_release(&mut self) {
+        self.gate = false;
+        self.uber_release = true;
+        self.uber_fade = 1.0;
+        self.amp_eg.release();
+        self.filter_eg.release();
+        self.pitch_eg.release();
     }
 
     pub fn release(&mut self) {
@@ -2453,12 +2577,454 @@ impl Voice {
         values
     }
 
+    fn reset_oversample_state(&mut self) {
+        self.os_up_l.reset();
+        self.os_up_r.reset();
+        self.os_up_f2_l.reset();
+        self.os_up_f2_r.reset();
+        self.os_down_l.reset();
+        self.os_down_r.reset();
+    }
+
+    /// Rebuild the four voice filters for `rate`, re-apply the current
+    /// filter parameter set, and clear all rate-dependent DSP state
+    /// (halfband FIR histories and the filter-feedback memory). Called when
+    /// the effective filter rate flips between host rate and 2×.
+    fn rebuild_voice_filters(&mut self, rate: f32) {
+        self.filter1_l = Filter::new(self.params.filter1.filter_type, rate);
+        self.filter1_r = Filter::new(self.params.filter1.filter_type, rate);
+        self.filter2_l = Filter::new(self.params.filter2.filter_type, rate);
+        self.filter2_r = Filter::new(self.params.filter2.filter_type, rate);
+        for (filter, settings) in [
+            (&mut self.filter1_l, &self.params.filter1),
+            (&mut self.filter1_r, &self.params.filter1),
+            (&mut self.filter2_l, &self.params.filter2),
+            (&mut self.filter2_r, &self.params.filter2),
+        ] {
+            filter.set_params(settings.cutoff_hz, settings.resonance);
+            filter.set_drive(settings.drive);
+            filter.set_feedback_drive(settings.feedback_drive);
+            filter.set_subtype(settings.subtype);
+        }
+        self.filter_sample_rate = rate;
+        self.filter_feedback_prev_l = 0.0;
+        self.filter_feedback_prev_r = 0.0;
+        self.reset_oversample_state();
+    }
+
+    /// Per-sample cutoff/resonance/drive values for the nonlinear filter
+    /// section, in absolute Hz. When the section runs at 2×, the voice
+    /// filters are built with the doubled rate, so the same absolute cutoff
+    /// maps to the same frequency at either rate.
+    fn compute_filter_sample_params(
+        &self,
+        mods: &ModValues,
+        ws_active: bool,
+    ) -> VoiceFilterSampleParams {
+        let f1_enabled = self.params.filter1.enabled;
+        let f1_cutoff = if f1_enabled {
+            let has_lfo1_f1 = self.params.modulations.iter().any(|r| {
+                r.active && r.source == ModSource::Lfo1 && r.target == ModTarget::Filter1Cutoff
+            });
+            // Routed to Filter1Cutoff in the mod matrix, the LFO contributes
+            // through `mods.f1_cutoff` instead of the direct path.
+            let lfo_output = if has_lfo1_f1 { 0.0 } else { self.lfo1_output };
+            filter_cutoff_hz(
+                self.params.filter1.cutoff_hz,
+                self.filter_eg_output,
+                self.params.filter1.eg_amount + mods.f1_eg_amount,
+                lfo_output,
+                self.params.filter1.key_tracking,
+                self.note,
+                cutoff_mod_semitones(mods.f1_cutoff),
+            )
+        } else {
+            20000.0
+        };
+        let f1_res = if f1_enabled {
+            (self.params.filter1.resonance + mods.f1_resonance).clamp(0.01, 10.0)
+        } else {
+            0.7
+        };
+        let f1_drive = if f1_enabled {
+            (self.params.filter1.drive + mods.f1_drive).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let f2_enabled = self.params.filter2.enabled;
+        let f2_cutoff = if f2_enabled {
+            let base = if self.params.f2_cutoff_offset {
+                f1_cutoff * (self.params.filter2.cutoff_hz / 10000.0).clamp(0.2, 5.0)
+            } else {
+                self.params.filter2.cutoff_hz
+            };
+            let has_lfo2_f2 = self.params.modulations.iter().any(|r| {
+                r.active && r.source == ModSource::Lfo2 && r.target == ModTarget::Filter2Cutoff
+            });
+            let lfo_output = if has_lfo2_f2 { 0.0 } else { self.lfo2_output };
+            filter_cutoff_hz(
+                base,
+                self.filter_eg_output,
+                self.params.filter2.eg_amount + mods.f2_eg_amount,
+                lfo_output,
+                self.params.filter2.key_tracking,
+                self.note,
+                cutoff_mod_semitones(mods.f2_cutoff),
+            )
+        } else {
+            20000.0
+        };
+        let f2_res = if f2_enabled {
+            if self.params.f2_res_link {
+                f1_res
+            } else {
+                (self.params.filter2.resonance + mods.f2_resonance).clamp(0.01, 10.0)
+            }
+        } else {
+            0.7
+        };
+        let f2_drive = if f2_enabled {
+            (self.params.filter2.drive + mods.f2_drive).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let ws_drive = if ws_active {
+            (self.params.waveshaper.drive + mods.waveshaper_drive).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        VoiceFilterSampleParams {
+            f1_cutoff,
+            f1_res,
+            f1_drive,
+            f2_cutoff,
+            f2_res,
+            f2_drive,
+            ws_drive,
+        }
+    }
+
+    /// One sample of the nonlinear filter section: feedback injection,
+    /// per-sample filter coefficient updates, the routing/waveshaper chain,
+    /// balance mix, and the filter-feedback pickup. This is the single
+    /// implementation of the section; it runs at host rate when the
+    /// oversample toggle is off (or nothing nonlinear is active) and twice
+    /// per host sample at 2× when it is on. In the 2× case the filter
+    /// feedback state and filter coefficients therefore live at the doubled
+    /// rate, and `params` is the host-sample value reused for both
+    /// sub-samples (cutoff modulation is host-rate, as in Surge).
+    fn filter_section_sample(
+        &mut self,
+        pre_filter_l: f32,
+        pre_filter_r: f32,
+        f2_pre_l: f32,
+        f2_pre_r: f32,
+        ctx: &VoiceFilterContext,
+        params: &VoiceFilterSampleParams,
+    ) -> (f32, f32) {
+        let fb = self.params.filter_feedback.clamp(-1.0, 1.0);
+        let fb_amount = fb.abs();
+        // Soft-clip the 1-sample feedback injection so the loop stays
+        // bounded at fb=1.0 (Surge does the same inside QuadFilterChain).
+        let pre_filter_l = pre_filter_l + (self.filter_feedback_prev_l * fb_amount).tanh();
+        let pre_filter_r = pre_filter_r + (self.filter_feedback_prev_r * fb_amount).tanh();
+
+        self.filter1_l
+            .prepare_block(params.f1_cutoff, params.f1_res, 1);
+        self.filter1_r
+            .prepare_block(params.f1_cutoff, params.f1_res, 1);
+        self.filter2_l
+            .prepare_block(params.f2_cutoff, params.f2_res, 1);
+        self.filter2_r
+            .prepare_block(params.f2_cutoff, params.f2_res, 1);
+
+        let balance = ctx.balance;
+        let ws_active = ctx.ws_active;
+        let f1_enabled = ctx.f1_enabled;
+        let f2_enabled = ctx.f2_enabled;
+        let ws_drive = params.ws_drive;
+        let f1_drive = params.f1_drive;
+        let f2_drive = params.f2_drive;
+        let (mut char_l, mut char_r, f1_out_l, f1_out_r) = if ctx.per_source_routing {
+            let mut f1_l = pre_filter_l;
+            let mut f1_r = pre_filter_r;
+            let mut f2_l = f2_pre_l;
+            let mut f2_r = f2_pre_r;
+            if f1_enabled {
+                self.filter1_l.set_drive(f1_drive);
+                self.filter1_r.set_drive(f1_drive);
+                f1_l = self.filter1_l.process(f1_l);
+                f1_r = self.filter1_r.process(f1_r);
+            }
+            if f2_enabled {
+                self.filter2_l.set_drive(f2_drive);
+                self.filter2_r.set_drive(f2_drive);
+                f2_l = self.filter2_l.process(f2_l);
+                f2_r = self.filter2_r.process(f2_r);
+            }
+            let sum_l = f1_l + f2_l;
+            let sum_r = f1_r + f2_r;
+            let (ws_l, ws_r) = if ws_active {
+                let mut ws = self.waveshaper;
+                ws.drive = ws_drive;
+                (ws.process(sum_l), ws.process(sum_r))
+            } else {
+                (sum_l, sum_r)
+            };
+            (ws_l, ws_r, f1_l, f1_r)
+        } else if !f1_enabled && !f2_enabled {
+            let (ws_l, ws_r) = if ws_active {
+                let mut ws = self.waveshaper;
+                ws.drive = ws_drive;
+                (ws.process(pre_filter_l), ws.process(pre_filter_r))
+            } else {
+                (pre_filter_l, pre_filter_r)
+            };
+            (ws_l, ws_r, ws_l, ws_r)
+        } else {
+            match self.params.filter_routing {
+                FilterRouting::Series => {
+                    let mut s_l = pre_filter_l;
+                    let mut s_r = pre_filter_r;
+                    if f1_enabled {
+                        self.filter1_l.set_drive(f1_drive);
+                        self.filter1_r.set_drive(f1_drive);
+                        s_l = self.filter1_l.process(s_l);
+                        s_r = self.filter1_r.process(s_r);
+                    }
+                    let (ws_l, ws_r) = if ws_active {
+                        let mut ws = self.waveshaper;
+                        ws.drive = ws_drive;
+                        (ws.process(s_l), ws.process(s_r))
+                    } else {
+                        (s_l, s_r)
+                    };
+                    let mut out_l = ws_l;
+                    let mut out_r = ws_r;
+                    if f2_enabled {
+                        self.filter2_l.set_drive(f2_drive);
+                        self.filter2_r.set_drive(f2_drive);
+                        out_l = self.filter2_l.process(out_l);
+                        out_r = self.filter2_r.process(out_r);
+                    }
+                    (out_l, out_r, ws_l, ws_r)
+                }
+                FilterRouting::Parallel => {
+                    let mut f1_l = pre_filter_l;
+                    let mut f1_r = pre_filter_r;
+                    let mut f2_l = pre_filter_l;
+                    let mut f2_r = pre_filter_r;
+                    if f1_enabled {
+                        self.filter1_l.set_drive(f1_drive);
+                        self.filter1_r.set_drive(f1_drive);
+                        f1_l = self.filter1_l.process(f1_l);
+                        f1_r = self.filter1_r.process(f1_r);
+                    }
+                    if f2_enabled {
+                        self.filter2_l.set_drive(f2_drive);
+                        self.filter2_r.set_drive(f2_drive);
+                        f2_l = self.filter2_l.process(f2_l);
+                        f2_r = self.filter2_r.process(f2_r);
+                    }
+                    let sum_l = (f1_l + f2_l) * 0.5;
+                    let sum_r = (f1_r + f2_r) * 0.5;
+                    let (ws_l, ws_r) = if ws_active {
+                        let mut ws = self.waveshaper;
+                        ws.drive = ws_drive;
+                        (ws.process(sum_l), ws.process(sum_r))
+                    } else {
+                        (sum_l, sum_r)
+                    };
+                    (ws_l, ws_r, f1_l, f1_r)
+                }
+                FilterRouting::Wide => {
+                    let mut s_l = pre_filter_l;
+                    let mut s_r = pre_filter_r;
+                    if f2_enabled {
+                        self.filter2_l.set_drive(f2_drive);
+                        self.filter2_r.set_drive(f2_drive);
+                        s_l = self.filter2_l.process(s_l);
+                        s_r = self.filter2_r.process(s_r);
+                    }
+                    let (ws_l, ws_r) = if ws_active {
+                        let mut ws = self.waveshaper;
+                        ws.drive = ws_drive;
+                        (ws.process(s_l), ws.process(s_r))
+                    } else {
+                        (s_l, s_r)
+                    };
+                    let mut out_l = ws_l;
+                    let mut out_r = ws_r;
+                    if f1_enabled {
+                        self.filter1_l.set_drive(f1_drive);
+                        self.filter1_r.set_drive(f1_drive);
+                        out_l = self.filter1_l.process(out_l);
+                        out_r = self.filter1_r.process(out_r);
+                    }
+                    (out_l, out_r, ws_l, ws_r)
+                }
+                FilterRouting::Split => {
+                    let mut f1_l = pre_filter_l;
+                    let f1_r = pre_filter_r;
+                    let f2_l = pre_filter_l;
+                    let mut f2_r = pre_filter_r;
+                    if f1_enabled {
+                        self.filter1_l.set_drive(f1_drive);
+                        self.filter1_r.set_drive(f1_drive);
+                        f1_l = self.filter1_l.process(f1_l);
+                        self.filter1_r.process(f1_r);
+                    }
+                    if f2_enabled {
+                        self.filter2_l.set_drive(f2_drive);
+                        self.filter2_r.set_drive(f2_drive);
+                        self.filter2_l.process(f2_l);
+                        f2_r = self.filter2_r.process(f2_r);
+                    }
+                    let stereo_l = f1_l;
+                    let stereo_r = f2_r;
+                    let (ws_l, ws_r) = if ws_active {
+                        let mut ws = self.waveshaper;
+                        ws.drive = ws_drive;
+                        (ws.process(stereo_l), ws.process(stereo_r))
+                    } else {
+                        (stereo_l, stereo_r)
+                    };
+                    (ws_l, ws_r, stereo_l, stereo_r)
+                }
+                FilterRouting::Serial2 => {
+                    let mut s_l = pre_filter_l;
+                    let mut s_r = pre_filter_r;
+                    if f2_enabled {
+                        self.filter2_l.set_drive(f2_drive);
+                        self.filter2_r.set_drive(f2_drive);
+                        s_l = self.filter2_l.process(s_l);
+                        s_r = self.filter2_r.process(s_r);
+                    }
+                    let (ws_l, ws_r) = if ws_active {
+                        let mut ws = self.waveshaper;
+                        ws.drive = ws_drive;
+                        (ws.process(s_l), ws.process(s_r))
+                    } else {
+                        (s_l, s_r)
+                    };
+                    let mut out_l = ws_l;
+                    let mut out_r = ws_r;
+                    if f1_enabled {
+                        self.filter1_l.set_drive(f1_drive);
+                        self.filter1_r.set_drive(f1_drive);
+                        out_l = self.filter1_l.process(out_l);
+                        out_r = self.filter1_r.process(out_r);
+                    }
+                    (out_l, out_r, ws_l, ws_r)
+                }
+                FilterRouting::Serial3 => {
+                    let mut s_l = pre_filter_l;
+                    let mut s_r = pre_filter_r;
+                    if f1_enabled {
+                        self.filter1_l.set_drive(f1_drive);
+                        self.filter1_r.set_drive(f1_drive);
+                        s_l = self.filter1_l.process(s_l);
+                        s_r = self.filter1_r.process(s_r);
+                    }
+                    let (ws_l, ws_r) = if ws_active {
+                        let mut ws = self.waveshaper;
+                        ws.drive = ws_drive;
+                        (ws.process(s_l), ws.process(s_r))
+                    } else {
+                        (s_l, s_r)
+                    };
+                    let mut f2_l = pre_filter_l;
+                    let mut f2_r = pre_filter_r;
+                    if f2_enabled {
+                        self.filter2_l.set_drive(f2_drive);
+                        self.filter2_r.set_drive(f2_drive);
+                        f2_l = self.filter2_l.process(f2_l);
+                        f2_r = self.filter2_r.process(f2_r);
+                    }
+                    let out_l = ws_l * 0.7 + f2_l * 0.3;
+                    let out_r = ws_r * 0.7 + f2_r * 0.3;
+                    (out_l, out_r, ws_l, ws_r)
+                }
+                FilterRouting::Dual2 => {
+                    let mut f1_l = pre_filter_l;
+                    let mut f1_r = pre_filter_r;
+                    let mut f2_l = pre_filter_l;
+                    let mut f2_r = pre_filter_r;
+                    if f1_enabled {
+                        self.filter1_l.set_drive(f1_drive);
+                        self.filter1_r.set_drive(f1_drive);
+                        f1_l = self.filter1_l.process(f1_l);
+                        f1_r = self.filter1_r.process(f1_r);
+                    }
+                    let (f1_ws_l, f1_ws_r) = if ws_active {
+                        let mut ws = self.waveshaper;
+                        ws.drive = ws_drive;
+                        (ws.process(f1_l), ws.process(f1_r))
+                    } else {
+                        (f1_l, f1_r)
+                    };
+                    if f2_enabled {
+                        self.filter2_l.set_drive(f2_drive);
+                        self.filter2_r.set_drive(f2_drive);
+                        f2_l = self.filter2_l.process(f2_l);
+                        f2_r = self.filter2_r.process(f2_r);
+                    }
+                    let out_l = (f1_ws_l + f2_l) * 0.5;
+                    let out_r = (f1_ws_r + f2_r) * 0.5;
+                    (out_l, out_r, f1_ws_l, f1_ws_r)
+                }
+                FilterRouting::Ring => {
+                    let mut f1_l = pre_filter_l;
+                    let mut f1_r = pre_filter_r;
+                    let mut f2_l = pre_filter_l;
+                    let mut f2_r = pre_filter_r;
+                    if f1_enabled {
+                        self.filter1_l.set_drive(f1_drive);
+                        self.filter1_r.set_drive(f1_drive);
+                        f1_l = self.filter1_l.process(f1_l);
+                        f1_r = self.filter1_r.process(f1_r);
+                    }
+                    if f2_enabled {
+                        self.filter2_l.set_drive(f2_drive);
+                        self.filter2_r.set_drive(f2_drive);
+                        f2_l = self.filter2_l.process(f2_l);
+                        f2_r = self.filter2_r.process(f2_r);
+                    }
+                    let ring_l = f1_l * f2_l;
+                    let ring_r = f1_r * f2_r;
+                    let (ws_l, ws_r) = if ws_active {
+                        let mut ws = self.waveshaper;
+                        ws.drive = ws_drive;
+                        (ws.process(ring_l), ws.process(ring_r))
+                    } else {
+                        (ring_l, ring_r)
+                    };
+                    (ws_l, ws_r, f1_l, f1_r)
+                }
+            }
+        };
+
+        let f2_mix = (balance + 1.0) * 0.5;
+        let f1_mix = 1.0 - f2_mix;
+        char_l = f1_out_l * f1_mix + char_l * f2_mix;
+        char_r = f1_out_r * f1_mix + char_r * f2_mix;
+
+        self.filter_feedback_prev_l = char_l;
+        self.filter_feedback_prev_r = char_r;
+
+        (char_l, char_r)
+    }
+
     pub fn process_block(
         &mut self,
         out_l: &mut [f32],
         out_r: &mut [f32],
         audio_in_l: Option<&[f32]>,
         audio_in_r: Option<&[f32]>,
+        scene_lfo_bufs: &[&[f32]; 6],
     ) {
         let frames = out_l.len().min(out_r.len());
         if frames == 0 {
@@ -2483,11 +3049,15 @@ impl Voice {
 
             let f1_enabled = self.params.filter1.enabled;
             let f1_cutoff_base = if f1_enabled {
-                let base = self.params.filter1.cutoff_hz;
-                let eg_mod = self.filter_eg_output * self.params.filter1.eg_amount * 10000.0;
-                let lfo_mod = self.lfo1_output * 5000.0;
-                let key_track = self.params.filter1.key_tracking * (self.note as f32 - 60.0) * 50.0;
-                (base + key_track + lfo_mod + eg_mod).clamp(20.0, 20000.0)
+                filter_cutoff_hz(
+                    self.params.filter1.cutoff_hz,
+                    self.filter_eg_output,
+                    self.params.filter1.eg_amount,
+                    self.lfo1_output,
+                    self.params.filter1.key_tracking,
+                    self.note,
+                    0.0,
+                )
             } else {
                 20000.0
             };
@@ -2508,10 +3078,15 @@ impl Voice {
                 } else {
                     self.params.filter2.cutoff_hz
                 };
-                let eg_mod = self.filter_eg_output * self.params.filter2.eg_amount * 10000.0;
-                let key_track = self.params.filter2.key_tracking * (self.note as f32 - 60.0) * 50.0;
-                let lfo_mod = self.lfo2_output * 5000.0;
-                (base + key_track + lfo_mod + eg_mod).clamp(20.0, 20000.0)
+                filter_cutoff_hz(
+                    base,
+                    self.filter_eg_output,
+                    self.params.filter2.eg_amount,
+                    self.lfo2_output,
+                    self.params.filter2.key_tracking,
+                    self.note,
+                    0.0,
+                )
             } else {
                 20000.0
             };
@@ -2532,6 +3107,13 @@ impl Voice {
             for i in 0..frames {
                 let audio_l = audio_in_l.map(|b| b[i]).unwrap_or(0.0);
                 let audio_r = audio_in_r.map(|b| b[i]).unwrap_or(0.0);
+
+                self.scene_lfo1_output = scene_lfo_bufs[0][i];
+                self.scene_lfo2_output = scene_lfo_bufs[1][i];
+                self.scene_lfo3_output = scene_lfo_bufs[2][i];
+                self.scene_lfo4_output = scene_lfo_bufs[3][i];
+                self.scene_lfo5_output = scene_lfo_bufs[4][i];
+                self.scene_lfo6_output = scene_lfo_bufs[5][i];
 
                 self.amp_eg_output = self.amp_eg.next();
                 self.filter_eg_output = self.filter_eg.next();
@@ -2705,12 +3287,36 @@ impl Voice {
             self.params.portamento
         };
 
+        // Decide the rate of the nonlinear filter section (filters with
+        // drive, waveshaper, filter feedback) for this whole block. The
+        // section only runs oversampled at 2× when the global toggle is on
+        // AND a nonlinear stage is active, so idle/dry voices pay nothing.
+        let ws_active =
+            self.params.waveshaper.enabled && self.params.waveshaper.shape != Waveshape::Off;
+        let f1_enabled = self.params.filter1.enabled;
+        let f2_enabled = self.params.filter2.enabled;
+        let fb_amount = self.params.filter_feedback.clamp(-1.0, 1.0).abs();
+        let nonlinear_active = ws_active || f1_enabled || f2_enabled || fb_amount > 0.0;
+        let oversample = self.params.voice_oversample && nonlinear_active;
+        let target_filter_rate = if oversample {
+            self.sample_rate * 2.0
+        } else {
+            self.sample_rate
+        };
+        if (self.filter_sample_rate - target_filter_rate).abs() > 1.0 {
+            self.rebuild_voice_filters(target_filter_rate);
+        }
+
         let f1_cutoff_base = if self.params.filter1.enabled {
-            let base = self.params.filter1.cutoff_hz;
-            let eg_mod = self.filter_eg_output * self.params.filter1.eg_amount * 10000.0;
-            let lfo_mod = self.lfo1_output * 5000.0;
-            let key_track = self.params.filter1.key_tracking * (self.note as f32 - 60.0) * 50.0;
-            (base + eg_mod + lfo_mod + key_track).clamp(20.0, 20000.0)
+            filter_cutoff_hz(
+                self.params.filter1.cutoff_hz,
+                self.filter_eg_output,
+                self.params.filter1.eg_amount,
+                self.lfo1_output,
+                self.params.filter1.key_tracking,
+                self.note,
+                0.0,
+            )
         } else {
             20000.0
         };
@@ -2730,10 +3336,15 @@ impl Voice {
             } else {
                 self.params.filter2.cutoff_hz
             };
-            let eg_mod = self.filter_eg_output * self.params.filter2.eg_amount * 10000.0;
-            let lfo_mod = self.lfo2_output * 5000.0;
-            let key_track = self.params.filter2.key_tracking * (self.note as f32 - 60.0) * 50.0;
-            (base + eg_mod + lfo_mod + key_track).clamp(20.0, 20000.0)
+            filter_cutoff_hz(
+                base,
+                self.filter_eg_output,
+                self.params.filter2.eg_amount,
+                self.lfo2_output,
+                self.params.filter2.key_tracking,
+                self.note,
+                0.0,
+            )
         } else {
             20000.0
         };
@@ -2754,6 +3365,13 @@ impl Voice {
         for i in 0..frames {
             let audio_l = audio_in_l.map(|b| b[i]).unwrap_or(0.0);
             let audio_r = audio_in_r.map(|b| b[i]).unwrap_or(0.0);
+
+            self.scene_lfo1_output = scene_lfo_bufs[0][i];
+            self.scene_lfo2_output = scene_lfo_bufs[1][i];
+            self.scene_lfo3_output = scene_lfo_bufs[2][i];
+            self.scene_lfo4_output = scene_lfo_bufs[3][i];
+            self.scene_lfo5_output = scene_lfo_bufs[4][i];
+            self.scene_lfo6_output = scene_lfo_bufs[5][i];
 
             let freq_diff = self.target_freq - self.current_freq;
             if portamento_time > 0.0 && freq_diff.abs() > 0.01 {
@@ -3128,8 +3746,17 @@ impl Voice {
             let sample_l = f1_mix_l + f2_mix_l;
             let sample_r = f1_mix_r + f2_mix_r;
 
-            let flavor_cutoff = (self.params.flavor_cutoff + cutoff_mod_hz(mods.flavor_cutoff))
-                .clamp(20.0, 20000.0);
+            // Flavor cutoff takes the same octave-space mod-matrix scaling as
+            // the voice filters (EG/LFO/keytrack don't apply here).
+            let flavor_cutoff = filter_cutoff_hz(
+                self.params.flavor_cutoff,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                60,
+                cutoff_mod_semitones(mods.flavor_cutoff),
+            );
             self.flavor.cutoff_hz = flavor_cutoff;
             self.flavor2.cutoff_hz = flavor_cutoff;
             let (f1_char_l, f1_char_r, f2_char_l, f2_char_r, char_out_l, char_out_r) =
@@ -3192,362 +3819,41 @@ impl Voice {
                 (pre_filter_l, pre_filter_r, pre_filter_l, pre_filter_r)
             };
 
-            let fb = self.params.filter_feedback.clamp(-1.0, 1.0);
-            let fb_amount = fb.abs();
-            let pre_filter_l = pre_filter_l + self.filter_feedback_prev_l * fb_amount;
-            let pre_filter_r = pre_filter_r + self.filter_feedback_prev_r * fb_amount;
-
-            let f1_enabled = self.params.filter1.enabled;
-            let f2_enabled = self.params.filter2.enabled;
-
-            let f1_cutoff = if f1_enabled {
-                let base = self.params.filter1.cutoff_hz;
-                let eg_mod = self.filter_eg_output
-                    * (self.params.filter1.eg_amount + mods.f1_eg_amount)
-                    * 10000.0;
-                let has_lfo1_f1 = self.params.modulations.iter().any(|r| {
-                    r.active && r.source == ModSource::Lfo1 && r.target == ModTarget::Filter1Cutoff
-                });
-                let lfo_mod = if has_lfo1_f1 {
-                    0.0
-                } else {
-                    self.lfo1_output * 5000.0
-                };
-                let key_track = self.params.filter1.key_tracking * (self.note as f32 - 60.0) * 50.0;
-                (base + eg_mod + lfo_mod + key_track + cutoff_mod_hz(mods.f1_cutoff))
-                    .clamp(20.0, 20000.0)
-            } else {
-                20000.0
+            let ctx = VoiceFilterContext {
+                balance: (self.params.filter_balance + mods.filter_balance).clamp(-1.0, 1.0),
+                ws_active,
+                f1_enabled,
+                f2_enabled,
+                per_source_routing,
             };
-            let f1_res = if f1_enabled {
-                (self.params.filter1.resonance + mods.f1_resonance).clamp(0.01, 10.0)
-            } else {
-                0.7
-            };
-            let f1_drive = if f1_enabled {
-                (self.params.filter1.drive + mods.f1_drive).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
+            let fp = self.compute_filter_sample_params(&mods, ws_active);
 
-            let f2_cutoff = if f2_enabled {
-                let base = if self.params.f2_cutoff_offset {
-                    f1_cutoff * (self.params.filter2.cutoff_hz / 10000.0).clamp(0.2, 5.0)
-                } else {
-                    self.params.filter2.cutoff_hz
-                };
-                let eg_mod = self.filter_eg_output
-                    * (self.params.filter2.eg_amount + mods.f2_eg_amount)
-                    * 10000.0;
-                let has_lfo2_f2 = self.params.modulations.iter().any(|r| {
-                    r.active && r.source == ModSource::Lfo2 && r.target == ModTarget::Filter2Cutoff
-                });
-                let lfo_mod = if has_lfo2_f2 {
-                    0.0
-                } else {
-                    self.lfo2_output * 5000.0
-                };
-                let key_track = self.params.filter2.key_tracking * (self.note as f32 - 60.0) * 50.0;
-                (base + eg_mod + lfo_mod + key_track + cutoff_mod_hz(mods.f2_cutoff))
-                    .clamp(20.0, 20000.0)
+            let (mut char_l, mut char_r) = if oversample {
+                // The halfband round trip adds a fixed ~31 base-rate samples
+                // of group delay (HALFBAND_LATENCY); Surge compensates
+                // filter-unit latency but these voice filters are otherwise
+                // zero-latency, so the small delay is accepted here and the
+                // toggle removes it entirely.
+                let (l0, l1) = self.os_up_l.process(pre_filter_l);
+                let (r0, r1) = self.os_up_r.process(pre_filter_r);
+                let (f2_l0, f2_l1) = self.os_up_f2_l.process(f2_pre_l);
+                let (f2_r0, f2_r1) = self.os_up_f2_r.process(f2_pre_r);
+                let (c0_l, c0_r) = self.filter_section_sample(l0, r0, f2_l0, f2_r0, &ctx, &fp);
+                let (c1_l, c1_r) = self.filter_section_sample(l1, r1, f2_l1, f2_r1, &ctx, &fp);
+                (
+                    self.os_down_l.process(c0_l, c1_l),
+                    self.os_down_r.process(c0_r, c1_r),
+                )
             } else {
-                20000.0
+                self.filter_section_sample(
+                    pre_filter_l,
+                    pre_filter_r,
+                    f2_pre_l,
+                    f2_pre_r,
+                    &ctx,
+                    &fp,
+                )
             };
-            let f2_res = if f2_enabled {
-                if self.params.f2_res_link {
-                    f1_res
-                } else {
-                    (self.params.filter2.resonance + mods.f2_resonance).clamp(0.01, 10.0)
-                }
-            } else {
-                0.7
-            };
-            let f2_drive = if f2_enabled {
-                (self.params.filter2.drive + mods.f2_drive).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-
-            self.filter1_l.prepare_block(f1_cutoff, f1_res, 1);
-            self.filter1_r.prepare_block(f1_cutoff, f1_res, 1);
-            self.filter2_l.prepare_block(f2_cutoff, f2_res, 1);
-            self.filter2_r.prepare_block(f2_cutoff, f2_res, 1);
-
-            let ws_active =
-                self.params.waveshaper.enabled && self.params.waveshaper.shape != Waveshape::Off;
-            let ws_drive = if ws_active {
-                (self.params.waveshaper.drive + mods.waveshaper_drive).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-
-            let (mut char_l, mut char_r, f1_out_l, f1_out_r) = if per_source_routing {
-                let mut f1_l = pre_filter_l;
-                let mut f1_r = pre_filter_r;
-                let mut f2_l = f2_pre_l;
-                let mut f2_r = f2_pre_r;
-                if f1_enabled {
-                    self.filter1_l.set_drive(f1_drive);
-                    self.filter1_r.set_drive(f1_drive);
-                    f1_l = self.filter1_l.process(f1_l);
-                    f1_r = self.filter1_r.process(f1_r);
-                }
-                if f2_enabled {
-                    self.filter2_l.set_drive(f2_drive);
-                    self.filter2_r.set_drive(f2_drive);
-                    f2_l = self.filter2_l.process(f2_l);
-                    f2_r = self.filter2_r.process(f2_r);
-                }
-                let sum_l = f1_l + f2_l;
-                let sum_r = f1_r + f2_r;
-                let (ws_l, ws_r) = if ws_active {
-                    let mut ws = self.waveshaper;
-                    ws.drive = ws_drive;
-                    (ws.process(sum_l), ws.process(sum_r))
-                } else {
-                    (sum_l, sum_r)
-                };
-                (ws_l, ws_r, f1_l, f1_r)
-            } else if !f1_enabled && !f2_enabled {
-                let (ws_l, ws_r) = if ws_active {
-                    let mut ws = self.waveshaper;
-                    ws.drive = ws_drive;
-                    (ws.process(pre_filter_l), ws.process(pre_filter_r))
-                } else {
-                    (pre_filter_l, pre_filter_r)
-                };
-                (ws_l, ws_r, ws_l, ws_r)
-            } else {
-                match self.params.filter_routing {
-                    FilterRouting::Series => {
-                        let mut s_l = pre_filter_l;
-                        let mut s_r = pre_filter_r;
-                        if f1_enabled {
-                            self.filter1_l.set_drive(f1_drive);
-                            self.filter1_r.set_drive(f1_drive);
-                            s_l = self.filter1_l.process(s_l);
-                            s_r = self.filter1_r.process(s_r);
-                        }
-                        let (ws_l, ws_r) = if ws_active {
-                            let mut ws = self.waveshaper;
-                            ws.drive = ws_drive;
-                            (ws.process(s_l), ws.process(s_r))
-                        } else {
-                            (s_l, s_r)
-                        };
-                        let mut out_l = ws_l;
-                        let mut out_r = ws_r;
-                        if f2_enabled {
-                            self.filter2_l.set_drive(f2_drive);
-                            self.filter2_r.set_drive(f2_drive);
-                            out_l = self.filter2_l.process(out_l);
-                            out_r = self.filter2_r.process(out_r);
-                        }
-                        (out_l, out_r, ws_l, ws_r)
-                    }
-                    FilterRouting::Parallel => {
-                        let mut f1_l = pre_filter_l;
-                        let mut f1_r = pre_filter_r;
-                        let mut f2_l = pre_filter_l;
-                        let mut f2_r = pre_filter_r;
-                        if f1_enabled {
-                            self.filter1_l.set_drive(f1_drive);
-                            self.filter1_r.set_drive(f1_drive);
-                            f1_l = self.filter1_l.process(f1_l);
-                            f1_r = self.filter1_r.process(f1_r);
-                        }
-                        if f2_enabled {
-                            self.filter2_l.set_drive(f2_drive);
-                            self.filter2_r.set_drive(f2_drive);
-                            f2_l = self.filter2_l.process(f2_l);
-                            f2_r = self.filter2_r.process(f2_r);
-                        }
-                        let sum_l = (f1_l + f2_l) * 0.5;
-                        let sum_r = (f1_r + f2_r) * 0.5;
-                        let (ws_l, ws_r) = if ws_active {
-                            let mut ws = self.waveshaper;
-                            ws.drive = ws_drive;
-                            (ws.process(sum_l), ws.process(sum_r))
-                        } else {
-                            (sum_l, sum_r)
-                        };
-                        (ws_l, ws_r, f1_l, f1_r)
-                    }
-                    FilterRouting::Wide => {
-                        let mut s_l = pre_filter_l;
-                        let mut s_r = pre_filter_r;
-                        if f2_enabled {
-                            self.filter2_l.set_drive(f2_drive);
-                            self.filter2_r.set_drive(f2_drive);
-                            s_l = self.filter2_l.process(s_l);
-                            s_r = self.filter2_r.process(s_r);
-                        }
-                        let (ws_l, ws_r) = if ws_active {
-                            let mut ws = self.waveshaper;
-                            ws.drive = ws_drive;
-                            (ws.process(s_l), ws.process(s_r))
-                        } else {
-                            (s_l, s_r)
-                        };
-                        let mut out_l = ws_l;
-                        let mut out_r = ws_r;
-                        if f1_enabled {
-                            self.filter1_l.set_drive(f1_drive);
-                            self.filter1_r.set_drive(f1_drive);
-                            out_l = self.filter1_l.process(out_l);
-                            out_r = self.filter1_r.process(out_r);
-                        }
-                        (out_l, out_r, ws_l, ws_r)
-                    }
-                    FilterRouting::Split => {
-                        let mut f1_l = pre_filter_l;
-                        let f1_r = pre_filter_r;
-                        let f2_l = pre_filter_l;
-                        let mut f2_r = pre_filter_r;
-                        if f1_enabled {
-                            self.filter1_l.set_drive(f1_drive);
-                            self.filter1_r.set_drive(f1_drive);
-                            f1_l = self.filter1_l.process(f1_l);
-                            self.filter1_r.process(f1_r);
-                        }
-                        if f2_enabled {
-                            self.filter2_l.set_drive(f2_drive);
-                            self.filter2_r.set_drive(f2_drive);
-                            self.filter2_l.process(f2_l);
-                            f2_r = self.filter2_r.process(f2_r);
-                        }
-                        let stereo_l = f1_l;
-                        let stereo_r = f2_r;
-                        let (ws_l, ws_r) = if ws_active {
-                            let mut ws = self.waveshaper;
-                            ws.drive = ws_drive;
-                            (ws.process(stereo_l), ws.process(stereo_r))
-                        } else {
-                            (stereo_l, stereo_r)
-                        };
-                        (ws_l, ws_r, stereo_l, stereo_r)
-                    }
-                    FilterRouting::Serial2 => {
-                        let mut s_l = pre_filter_l;
-                        let mut s_r = pre_filter_r;
-                        if f2_enabled {
-                            self.filter2_l.set_drive(f2_drive);
-                            self.filter2_r.set_drive(f2_drive);
-                            s_l = self.filter2_l.process(s_l);
-                            s_r = self.filter2_r.process(s_r);
-                        }
-                        let (ws_l, ws_r) = if ws_active {
-                            let mut ws = self.waveshaper;
-                            ws.drive = ws_drive;
-                            (ws.process(s_l), ws.process(s_r))
-                        } else {
-                            (s_l, s_r)
-                        };
-                        let mut out_l = ws_l;
-                        let mut out_r = ws_r;
-                        if f1_enabled {
-                            self.filter1_l.set_drive(f1_drive);
-                            self.filter1_r.set_drive(f1_drive);
-                            out_l = self.filter1_l.process(out_l);
-                            out_r = self.filter1_r.process(out_r);
-                        }
-                        (out_l, out_r, ws_l, ws_r)
-                    }
-                    FilterRouting::Serial3 => {
-                        let mut s_l = pre_filter_l;
-                        let mut s_r = pre_filter_r;
-                        if f1_enabled {
-                            self.filter1_l.set_drive(f1_drive);
-                            self.filter1_r.set_drive(f1_drive);
-                            s_l = self.filter1_l.process(s_l);
-                            s_r = self.filter1_r.process(s_r);
-                        }
-                        let (ws_l, ws_r) = if ws_active {
-                            let mut ws = self.waveshaper;
-                            ws.drive = ws_drive;
-                            (ws.process(s_l), ws.process(s_r))
-                        } else {
-                            (s_l, s_r)
-                        };
-                        let mut f2_l = pre_filter_l;
-                        let mut f2_r = pre_filter_r;
-                        if f2_enabled {
-                            self.filter2_l.set_drive(f2_drive);
-                            self.filter2_r.set_drive(f2_drive);
-                            f2_l = self.filter2_l.process(f2_l);
-                            f2_r = self.filter2_r.process(f2_r);
-                        }
-                        let out_l = ws_l * 0.7 + f2_l * 0.3;
-                        let out_r = ws_r * 0.7 + f2_r * 0.3;
-                        (out_l, out_r, ws_l, ws_r)
-                    }
-                    FilterRouting::Dual2 => {
-                        let mut f1_l = pre_filter_l;
-                        let mut f1_r = pre_filter_r;
-                        let mut f2_l = pre_filter_l;
-                        let mut f2_r = pre_filter_r;
-                        if f1_enabled {
-                            self.filter1_l.set_drive(f1_drive);
-                            self.filter1_r.set_drive(f1_drive);
-                            f1_l = self.filter1_l.process(f1_l);
-                            f1_r = self.filter1_r.process(f1_r);
-                        }
-                        let (f1_ws_l, f1_ws_r) = if ws_active {
-                            let mut ws = self.waveshaper;
-                            ws.drive = ws_drive;
-                            (ws.process(f1_l), ws.process(f1_r))
-                        } else {
-                            (f1_l, f1_r)
-                        };
-                        if f2_enabled {
-                            self.filter2_l.set_drive(f2_drive);
-                            self.filter2_r.set_drive(f2_drive);
-                            f2_l = self.filter2_l.process(f2_l);
-                            f2_r = self.filter2_r.process(f2_r);
-                        }
-                        let out_l = (f1_ws_l + f2_l) * 0.5;
-                        let out_r = (f1_ws_r + f2_r) * 0.5;
-                        (out_l, out_r, f1_ws_l, f1_ws_r)
-                    }
-                    FilterRouting::Ring => {
-                        let mut f1_l = pre_filter_l;
-                        let mut f1_r = pre_filter_r;
-                        let mut f2_l = pre_filter_l;
-                        let mut f2_r = pre_filter_r;
-                        if f1_enabled {
-                            self.filter1_l.set_drive(f1_drive);
-                            self.filter1_r.set_drive(f1_drive);
-                            f1_l = self.filter1_l.process(f1_l);
-                            f1_r = self.filter1_r.process(f1_r);
-                        }
-                        if f2_enabled {
-                            self.filter2_l.set_drive(f2_drive);
-                            self.filter2_r.set_drive(f2_drive);
-                            f2_l = self.filter2_l.process(f2_l);
-                            f2_r = self.filter2_r.process(f2_r);
-                        }
-                        let ring_l = f1_l * f2_l;
-                        let ring_r = f1_r * f2_r;
-                        let (ws_l, ws_r) = if ws_active {
-                            let mut ws = self.waveshaper;
-                            ws.drive = ws_drive;
-                            (ws.process(ring_l), ws.process(ring_r))
-                        } else {
-                            (ring_l, ring_r)
-                        };
-                        (ws_l, ws_r, f1_l, f1_r)
-                    }
-                }
-            };
-
-            let balance = (self.params.filter_balance + mods.filter_balance).clamp(-1.0, 1.0);
-            let f2_mix = (balance + 1.0) * 0.5;
-            let f1_mix = 1.0 - f2_mix;
-            char_l = f1_out_l * f1_mix + char_l * f2_mix;
-            char_r = f1_out_r * f1_mix + char_r * f2_mix;
-
-            self.filter_feedback_prev_l = char_l;
-            self.filter_feedback_prev_r = char_r;
 
             let vol = (self.params.volume + mods.output_volume).clamp(0.0, 2.0);
             let vca_level = self.params.vca_level.clamp(0.0, 2.0);
@@ -3560,8 +3866,20 @@ impl Voice {
             } else {
                 1.0
             };
-            char_l *= self.amp_eg_output * effective_vel * vol * vca_level * note_on_fade;
-            char_r *= self.amp_eg_output * effective_vel * vol * vca_level * note_on_fade;
+            let uber_fade = if self.uber_release {
+                self.uber_fade -= 1.0 / (UBER_RELEASE_SECONDS * self.sample_rate);
+                if self.uber_fade <= 0.0 {
+                    self.uber_fade = 0.0;
+                    self.active = false;
+                }
+                self.uber_fade.max(0.0)
+            } else {
+                1.0
+            };
+            char_l *=
+                self.amp_eg_output * effective_vel * vol * vca_level * note_on_fade * uber_fade;
+            char_r *=
+                self.amp_eg_output * effective_vel * vol * vca_level * note_on_fade * uber_fade;
 
             let pan = (self.params.pan + mods.output_pan).clamp(-1.0, 1.0);
             let width = (self.params.width + mods.output_width).clamp(-1.0, 1.0);
@@ -3755,7 +4073,16 @@ mod tests {
         let mut out_r = vec![0.0f32; frames];
 
         voice.trigger(60, 1.0);
-        voice.process_block(&mut out_l, &mut out_r, None, None);
+        let scene_lfo_bufs: [Vec<f32>; 6] = std::array::from_fn(|_| vec![0.0f32; frames]);
+        let scene_lfo_slices = [
+            scene_lfo_bufs[0].as_slice(),
+            scene_lfo_bufs[1].as_slice(),
+            scene_lfo_bufs[2].as_slice(),
+            scene_lfo_bufs[3].as_slice(),
+            scene_lfo_bufs[4].as_slice(),
+            scene_lfo_bufs[5].as_slice(),
+        ];
+        voice.process_block(&mut out_l, &mut out_r, None, None, &scene_lfo_slices);
 
         let path = "/tmp/maolan_saw_test.wav";
         write_wav_stereo(path, &out_l, &out_r, sample_rate as u32).unwrap();
@@ -3772,5 +4099,80 @@ mod tests {
         for i in 0..20.min(frames) {
             println!("{i}: {:.6} {:.6}", out_l[i], out_r[i]);
         }
+    }
+
+    #[test]
+    fn set_sample_rate_retargets_oscillators() {
+        // SYNTH.md P2 item 13: Voice::set_sample_rate must re-target the
+        // oscillators, otherwise a host rate change detunes every note.
+        fn render_at(voice: &mut Voice, frames: usize) -> Vec<f32> {
+            let mut out_l = vec![0.0f32; frames];
+            let mut out_r = vec![0.0f32; frames];
+            let scene_lfo_bufs: [Vec<f32>; 6] = std::array::from_fn(|_| vec![0.0f32; frames]);
+            let scene_lfo_slices = [
+                scene_lfo_bufs[0].as_slice(),
+                scene_lfo_bufs[1].as_slice(),
+                scene_lfo_bufs[2].as_slice(),
+                scene_lfo_bufs[3].as_slice(),
+                scene_lfo_bufs[4].as_slice(),
+                scene_lfo_bufs[5].as_slice(),
+            ];
+            voice.trigger(69, 1.0);
+            voice.process_block(&mut out_l, &mut out_r, None, None, &scene_lfo_slices);
+            out_l
+        }
+
+        let mut voice = Voice::new(48000.0);
+        voice.params.oscs[0].level = 0.8;
+        voice.params.oscs[1].enabled = false;
+        voice.params.oscs[2].enabled = false;
+        voice.params.noise.enabled = false;
+        voice.params.oscs[0].unison_voices = 1;
+        voice.params.filter1.enabled = false;
+        voice.params.filter2.enabled = false;
+        voice.params.filter_feedback = 0.0;
+        voice.params.waveshaper.enabled = false;
+        voice.params.flavor = crate::common::flavor::FlavorType::Off;
+        voice.params.amp_eg.attack = 0.0;
+        voice.params.amp_eg.decay = 0.0;
+        voice.params.amp_eg.sustain = 1.0;
+        let params = voice.params.clone();
+        voice.set_params(&params);
+
+        let control = render_at(&mut voice, 4096);
+        let c_cross: Vec<usize> = control
+            .windows(2)
+            .enumerate()
+            .filter_map(|(i, w)| (w[0] < 0.0 && w[1] >= 0.0).then_some(i + 1))
+            .collect();
+        let c_per: Vec<f32> = c_cross.windows(2).map(|w| (w[1] - w[0]) as f32).collect();
+        let c_mean = c_per.iter().sum::<f32>() / c_per.len() as f32;
+        assert!(
+            (48000.0 / c_mean - 440.0).abs() < 5.0,
+            "control render off: {} Hz",
+            48000.0 / c_mean
+        );
+
+        voice.set_sample_rate(96000.0);
+        // 440 Hz at 96 kHz: one cycle is ~218.18 samples; 4096 samples hold
+        // ~18.8 cycles.
+        let out = render_at(&mut voice, 4096);
+        let crossings: Vec<usize> = out
+            .windows(2)
+            .enumerate()
+            .filter_map(|(i, w)| (w[0] < 0.0 && w[1] >= 0.0).then_some(i + 1))
+            .collect();
+        assert!(
+            crossings.len() >= 15,
+            "too few crossings: {}",
+            crossings.len()
+        );
+        let periods: Vec<f32> = crossings.windows(2).map(|w| (w[1] - w[0]) as f32).collect();
+        let mean_period = periods.iter().sum::<f32>() / periods.len() as f32;
+        let freq = 96000.0 / mean_period;
+        assert!(
+            (freq - 440.0).abs() < 5.0,
+            "oscillator stale after set_sample_rate: {freq} Hz"
+        );
     }
 }

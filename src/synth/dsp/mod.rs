@@ -21,7 +21,7 @@ pub use crate::common::tuning::Tuning;
 pub use crate::common::voice::{PlayMode, PortamentoCurve, StealMode, VoicePriority};
 pub use crate::common::waveshaper::{Waveshape, Waveshaper};
 
-pub use engine::SynthEngine;
+pub use engine::{SynthEngine, soft_clip_master};
 pub use oscillator::{
     AliasWaveform, ClassicOsc, ClassicWaveform, ExciterType, Fm2FeedbackMode, Fm3FeedbackMode,
     ModernSubWaveform, OscType, Oscillator, SineShaperMode, WindowType,

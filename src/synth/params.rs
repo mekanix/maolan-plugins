@@ -3,6 +3,8 @@ use clap_clap::ffi::{
     CLAP_PARAM_REQUIRES_PROCESS,
 };
 
+use crate::common::wavetable_factory::FACTORY_COUNT;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ParamId {
@@ -762,10 +764,10 @@ pub enum ParamId {
     Ring12Combinator = 710,
     Ring23Combinator = 711,
 
-    Reserved712 = 712,
-    Reserved713 = 713,
-    Reserved714 = 714,
-    Reserved715 = 715,
+    Osc1Wavetable = 712,
+    Osc2Wavetable = 713,
+    Osc3Wavetable = 714,
+    Oversample = 715,
     Reserved716 = 716,
     Reserved717 = 717,
     Reserved718 = 718,
@@ -3377,6 +3379,28 @@ pub static PARAMS: &[ParamDef] = &[
         10.0,
         0.0
     ),
+    def_enum!(
+        ParamId::Osc1Wavetable,
+        "Wavetable",
+        "Osc1",
+        FACTORY_COUNT as f64,
+        0.0
+    ),
+    def_enum!(
+        ParamId::Osc2Wavetable,
+        "Wavetable",
+        "Osc2",
+        FACTORY_COUNT as f64,
+        0.0
+    ),
+    def_enum!(
+        ParamId::Osc3Wavetable,
+        "Wavetable",
+        "Osc3",
+        FACTORY_COUNT as f64,
+        0.0
+    ),
+    def_toggle!(ParamId::Oversample, "Oversample", "Global", 1.0),
 ];
 
 pub fn param_def(id: ParamId) -> Option<&'static ParamDef> {
