@@ -33,11 +33,11 @@ use portable_atomic::{AtomicF32, AtomicF64};
 use std::mem::size_of;
 
 use crate::common::bus;
+use crate::common::halfband::{HALFBAND_LATENCY, HalfbandDownsampler, HalfbandUpsampler};
 use crate::eq::dsp::{MAX_BANDS, ParametricEqualizer};
 use crate::eq::gui::{
     EDITOR_HEIGHT, EDITOR_WIDTH, GuiBridge, ParentWindowHandle, is_api_supported, preferred_api,
 };
-use crate::eq::halfband::{HALFBAND_LATENCY, HalfbandDownsampler, HalfbandUpsampler};
 use crate::eq::linear_phase::{BandDesign, LP_LATENCY, LinearPhaseEq};
 use crate::eq::params::{
     PARAMS, ParamDef, ParamId, ParamIdExt, ParamStore, copy_str_to_array, sanitize_param_value,

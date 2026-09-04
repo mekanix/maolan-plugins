@@ -1,8 +1,7 @@
-#![allow(dead_code)]
-
 use std::f32::consts::PI;
 
-use crate::common::oscillator::UnisonVoice;
+use crate::common::oscillator::{UnisonVoice, dpw_droop_compensation, poly_blep};
+use crate::common::unison;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TwistModel {
@@ -66,20 +65,22 @@ pub struct TwistOsc {
     fm_index: f32,
     fm_feedback: f32,
     fm_fb_buf: f32,
+    /// DPW (differentiated parabolic waveform) history for the Wavefolder
+    /// model's triangle component: the two previous samples of the periodic
+    /// double integral `dpw_tri_cubic`, in f64 (the second difference
+    /// cancels down to ~dt²).
+    wf_tri_state: [f64; 2],
 
     har_phases: [f32; 16],
 
     string_buffer: Vec<f32>,
     string_pos: usize,
     string_exciter: f32,
-    string_decay: f32,
-    string_brightness: f32,
     string_filter: f32,
 
     noise_filter_l: f32,
     noise_filter_r: f32,
     noise_filter_bp: f32,
-    noise_resonance: f32,
 
     chord_phases: [f32; 4],
 
@@ -108,13 +109,14 @@ pub struct TwistOsc {
     modal_modes: [f32; 4],
     modal_velocities: [f32; 4],
 
-    particle_filters: [f32; 6],
+    particle_filters: [[f32; 2]; 8],
 
     hihat_env: f32,
     hihat_noise_state: f32,
 
     unison_voices: usize,
     unison_detune: f32,
+    unison_spread: f32,
     aux_mix: f32,
 
     lpg_response: f32,
@@ -142,17 +144,15 @@ impl TwistOsc {
             fm_index: 1.0,
             fm_feedback: 0.0,
             fm_fb_buf: 0.0,
+            wf_tri_state: [0.0; 2],
             har_phases: [0.0; 16],
             string_buffer: vec![0.0; 2048],
             string_pos: 0,
             string_exciter: 0.0,
-            string_decay: 0.99,
-            string_brightness: 0.5,
             string_filter: 0.0,
             noise_filter_l: 0.0,
             noise_filter_r: 0.0,
             noise_filter_bp: 0.0,
-            noise_resonance: 0.5,
             chord_phases: [0.0; 4],
             fn_filter_state: 0.0,
             kick_env: 0.0,
@@ -172,11 +172,12 @@ impl TwistOsc {
             inh_string_exciter: 0.0,
             modal_modes: [0.0; 4],
             modal_velocities: [0.0; 4],
-            particle_filters: [0.0; 6],
+            particle_filters: [[0.0; 2]; 8],
             hihat_env: 0.0,
             hihat_noise_state: 0.0,
             unison_voices: 1,
             unison_detune: 0.1,
+            unison_spread: 1.0,
             aux_mix: 0.0,
             lpg_response: 0.0,
             lpg_decay: 0.0,
@@ -189,6 +190,7 @@ impl TwistOsc {
     pub fn set_freq_hz(&mut self, freq: f32) {
         self.freq_hz = freq;
         self.update_va_incs();
+        self.rebuild_wf_tri_history();
     }
 
     pub fn reset(&mut self) {
@@ -219,7 +221,7 @@ impl TwistOsc {
         self.inh_string_exciter = 0.0;
         self.modal_modes = [0.0; 4];
         self.modal_velocities = [0.0; 4];
-        self.particle_filters = [0.0; 6];
+        self.particle_filters = [[0.0; 2]; 8];
         self.hihat_env = 0.0;
         self.hihat_noise_state = 0.0;
         self.lpg_env = 0.0;
@@ -228,6 +230,7 @@ impl TwistOsc {
         for v in &mut self.va_voices {
             v.phase = 0.0;
         }
+        self.rebuild_wf_tri_history();
     }
 
     pub fn reset_to_zero(&mut self) {
@@ -244,6 +247,10 @@ impl TwistOsc {
 
     pub fn set_timbre(&mut self, v: f32) {
         self.timbre = v.clamp(0.0, 1.0);
+    }
+
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.sample_rate = sample_rate.max(1.0);
     }
 
     pub fn set_morph(&mut self, v: f32) {
@@ -265,6 +272,11 @@ impl TwistOsc {
     pub fn set_unison(&mut self, voices: usize, detune: f32) {
         self.unison_voices = voices.max(1);
         self.unison_detune = detune;
+        self.rebuild_va_voices();
+    }
+
+    pub fn set_unison_spread(&mut self, spread: f32) {
+        self.unison_spread = spread.clamp(0.0, 1.0);
         self.rebuild_va_voices();
     }
 
@@ -327,58 +339,62 @@ impl TwistOsc {
     fn rebuild_va_voices(&mut self) {
         self.va_voices.clear();
         let base_inc = self.freq_hz / self.sample_rate;
-        for i in 0..self.unison_voices {
-            let detune = if self.unison_voices > 1 {
-                let spread = self.unison_detune;
-                (i as f32 / (self.unison_voices.saturating_sub(1).max(1) as f32) - 0.5)
-                    * spread
-                    * 2.0
-            } else {
-                0.0
-            };
-            let pan = if self.unison_voices > 1 {
-                i as f32 / (self.unison_voices.saturating_sub(1).max(1) as f32)
-            } else {
-                0.5
-            };
-            self.va_voices
-                .push(UnisonVoice::new(0.0, base_inc * (1.0 + detune * 0.02), pan));
+        let n = self.unison_voices;
+        for i in 0..n {
+            let (pan_l, pan_r) = unison::pan_gains(i, n, self.unison_spread);
+            self.va_voices.push(UnisonVoice::new(
+                0.0,
+                base_inc * unison::detune_ratio(i, n, self.unison_detune),
+                pan_l,
+                pan_r,
+            ));
         }
     }
 
     fn update_va_incs(&mut self) {
         let base_inc = self.freq_hz / self.sample_rate;
+        let n = self.unison_voices;
         for (i, v) in self.va_voices.iter_mut().enumerate() {
-            let detune = if self.unison_voices > 1 {
-                let spread = self.unison_detune;
-                (i as f32 / (self.unison_voices.saturating_sub(1).max(1) as f32) - 0.5)
-                    * spread
-                    * 2.0
-            } else {
-                0.0
-            };
-            v.phase_inc = base_inc * (1.0 + detune * 0.02);
+            v.phase_inc = base_inc * unison::detune_ratio(i, n, self.unison_detune);
         }
+    }
+
+    /// Re-derive the Wavefolder triangle DPW history from the current
+    /// carrier phase and stride so the next sample continues the double
+    /// integral exactly (no click on note-on / pitch change).
+    fn rebuild_wf_tri_history(&mut self) {
+        let inc = self.freq_hz / self.sample_rate;
+        let phase = self.fm_carrier_phase;
+        self.wf_tri_state = [dpw_tri_cubic(phase - inc), dpw_tri_cubic(phase - 2.0 * inc)];
     }
 
     fn next_va(&mut self) -> (f32, f32) {
         let mut sum_l = 0.0f32;
         let mut sum_r = 0.0f32;
+        let pw = self.va_pulse_width;
+        let shape = self.va_shape;
 
         for voice in &mut self.va_voices {
-            voice.phase += voice.phase_inc;
+            let dt = voice.phase_inc;
+            voice.phase += dt;
             if voice.phase >= 1.0 {
                 voice.phase -= 1.0;
             }
 
             let t = voice.phase;
 
-            let saw = 2.0 * t - 1.0;
-            let square = if t < self.va_pulse_width { 1.0 } else { -1.0 };
-            let out = saw * (1.0 - self.va_shape) + square * self.va_shape;
+            // Band-limited saw and pulse: polyBLEP residuals on the wrap and
+            // pulse edges, scaled by the per-voice instantaneous frequency
+            // increment so they stay correct under unison detune.
+            let mut saw = 2.0 * t - 1.0;
+            saw -= poly_blep(t, dt);
+            let mut square = if t < pw { 1.0 } else { -1.0 };
+            square += poly_blep(t, dt);
+            square -= poly_blep((t + 1.0 - pw).fract(), dt);
+            let out = saw * (1.0 - shape) + square * shape;
 
-            sum_l += out * (1.0 - voice.pan);
-            sum_r += out * voice.pan;
+            sum_l += out * voice.pan_l;
+            sum_r += out * voice.pan_r;
         }
 
         let atten = 1.0 / (self.unison_voices as f32).sqrt();
@@ -402,7 +418,18 @@ impl TwistOsc {
         let phase = (base_phase + fm).fract();
 
         let sin_in = (phase * 2.0 * PI).sin();
-        let tri_in = 1.0 - 4.0 * (phase - 0.5).abs();
+        // The sine component is inherently band-limited; the triangle is
+        // rendered with DPW (a second difference of its periodic double
+        // integral) so its harmonics do not fold back. Under external FM the
+        // phase stride departs from `inc` and the DPW history is only
+        // approximately consistent — an accepted tradeoff, as the fold itself
+        // dominates the residual aliasing anyway.
+        let p = dpw_tri_cubic(phase);
+        let d = p - 2.0 * self.wf_tri_state[0] + self.wf_tri_state[1];
+        self.wf_tri_state[1] = self.wf_tri_state[0];
+        self.wf_tri_state[0] = p;
+        let inc64 = inc as f64;
+        let tri_in = (d / (inc64 * inc64)) as f32 * dpw_droop_compensation(inc);
         let input = sin_in * (1.0 - waveform) + tri_in * waveform;
 
         let x = (input + asym) * drive;
@@ -828,13 +855,18 @@ impl TwistOsc {
 
     fn next_particle_noise(&mut self) -> (f32, f32) {
         let sr = self.sample_rate;
-        let n_particles = (self.harmonics * 6.0) as usize + 2;
+        let n_particles = ((self.harmonics * 6.0) as usize + 2).min(self.particle_filters.len());
         let base_cutoff = 100.0 + self.timbre * 8000.0;
         let resonance = 2.0 + self.morph * 8.0;
 
         let noise = fast_rand() * 2.0 - 1.0;
         let mut out = 0.0f32;
-        for i in 0..n_particles {
+        for (i, state) in self
+            .particle_filters
+            .iter_mut()
+            .enumerate()
+            .take(n_particles)
+        {
             let cutoff = base_cutoff * (1.0 + i as f32 * 0.7);
             let fc = (cutoff / sr).clamp(0.0001, 0.45);
             let omega = 2.0 * PI * fc;
@@ -848,11 +880,11 @@ impl TwistOsc {
             let a1 = -2.0 * cos_omega;
             let a2 = 1.0 - alpha;
 
-            let s0 = self.particle_filters[i * 2 % 6];
-            let s1 = self.particle_filters[(i * 2 + 1) % 6];
+            let s0 = state[0];
+            let s1 = state[1];
             let filtered = (b0 * noise + b1 * s0 + b2 * s1) / a0 - (a1 * s0 + a2 * s1) / a0;
-            self.particle_filters[(i * 2 + 1) % 6] = s0;
-            self.particle_filters[i * 2 % 6] = filtered;
+            state[1] = s0;
+            state[0] = filtered;
             out += filtered;
         }
         out /= n_particles as f32;
@@ -901,6 +933,20 @@ impl TwistOsc {
 
         let out = filtered * self.hihat_env;
         (out, out)
+    }
+}
+
+/// Periodic double integral of the unit triangle `1 - 4|t - 0.5|`, chosen
+/// C¹ across the phase wrap: its second derivative is exactly the triangle,
+/// so a discrete second difference of sampled values (scaled by `1/dt²`
+/// and droop-compensated) yields a band-limited triangle (DPW).
+#[inline]
+fn dpw_tri_cubic(phase: f32) -> f64 {
+    let p = (phase as f64).rem_euclid(1.0);
+    if p <= 0.5 {
+        (2.0 / 3.0) * p * p * p - 0.5 * p * p - 1.0 / 6.0
+    } else {
+        -(2.0 / 3.0) * p * p * p + 1.5 * p * p - p
     }
 }
 

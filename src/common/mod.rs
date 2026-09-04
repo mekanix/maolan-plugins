@@ -10,6 +10,7 @@ pub mod filter;
 pub mod flavor;
 pub mod fx;
 pub mod gain_pan;
+pub mod halfband;
 pub mod lfo;
 pub mod lfo_assignment;
 pub mod mmap;
@@ -19,7 +20,6 @@ pub mod monolith_cache;
 pub mod mts_esp;
 pub mod noise;
 pub mod oscillator;
-pub mod oversample;
 pub mod param_events;
 pub mod param_store;
 pub mod phasor;
@@ -35,10 +35,12 @@ pub mod state;
 pub mod tuning;
 pub mod twist;
 pub mod ui;
+pub mod unison;
 pub mod voice;
 pub mod waveform;
 pub mod waveshaper;
 pub mod wavetable;
+pub mod wavetable_factory;
 
 pub use param_events::{
     ClapParamId, SharedStateExt, apply_param_events, copy_str_to_array,

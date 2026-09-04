@@ -1,8 +1,28 @@
 #![allow(dead_code)]
 
 use super::{Lfo, ModTarget, MtsEspClient, PlayMode, StealMode, Voice, VoiceParams, VoicePriority};
+use crate::common::wavetable::Wavetable;
+use crate::common::wavetable_factory::{FACTORY_COUNT, factory_table};
 use parking_lot::Mutex;
 use std::sync::Arc;
+
+/// Knee of the master output clipper, in linear amplitude: samples with
+/// |x| at or below this pass through bit-transparently.
+const MASTER_CLIP_KNEE: f32 = 0.98;
+
+/// Final clip protection on the engine's summed stereo master output.
+/// Always on (no parameter); Surge hard-clips its master similarly, this is
+/// the softer-knee variant. Identity for |x| ≤ `MASTER_CLIP_KNEE`; above the
+/// knee a tanh segment saturates smoothly toward ±1 with matching slope at
+/// the knee (C¹-continuous), monotonically, strictly bounded by ±1.
+pub fn soft_clip_master(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax <= MASTER_CLIP_KNEE {
+        return x;
+    }
+    let over = (ax - MASTER_CLIP_KNEE) / (1.0 - MASTER_CLIP_KNEE);
+    x.signum() * (MASTER_CLIP_KNEE + (1.0 - MASTER_CLIP_KNEE) * over.tanh())
+}
 
 #[derive(Debug, Clone)]
 pub struct SynthEngine {
@@ -21,9 +41,14 @@ pub struct SynthEngine {
     pub scene_lfo4: Lfo,
     pub scene_lfo5: Lfo,
     pub scene_lfo6: Lfo,
+    scene_lfo_bufs: [Vec<f32>; 6],
+    pitch_bend: f32,
     temp_l: Vec<f32>,
     temp_r: Vec<f32>,
     visual_lfo_mod_values: [[f32; ModTarget::COUNT as usize]; 6],
+    /// Per-oscillator custom wavetable loaded from a user file (param value
+    /// `FACTORY_COUNT` selects this; lower values select factory tables).
+    custom_wavetables: [Option<Arc<Wavetable>>; 3],
 }
 
 impl SynthEngine {
@@ -32,7 +57,7 @@ impl SynthEngine {
         for _ in 0..max_voices {
             voices.push(Voice::new(sample_rate));
         }
-        Self {
+        let mut engine = Self {
             sample_rate,
             voices,
             max_voices,
@@ -48,10 +73,27 @@ impl SynthEngine {
             scene_lfo4: Lfo::new(sample_rate),
             scene_lfo5: Lfo::new(sample_rate),
             scene_lfo6: Lfo::new(sample_rate),
+            scene_lfo_bufs: [
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ],
+            pitch_bend: 0.0,
             temp_l: Vec::new(),
             temp_r: Vec::new(),
             visual_lfo_mod_values: [[0.0; ModTarget::COUNT as usize]; 6],
-        }
+            custom_wavetables: [None, None, None],
+        };
+        engine.scene_lfo1.reset();
+        engine.scene_lfo2.reset();
+        engine.scene_lfo3.reset();
+        engine.scene_lfo4.reset();
+        engine.scene_lfo5.reset();
+        engine.scene_lfo6.reset();
+        engine
     }
 
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
@@ -65,14 +107,24 @@ impl SynthEngine {
         self.scene_lfo4 = Lfo::new(sample_rate);
         self.scene_lfo5 = Lfo::new(sample_rate);
         self.scene_lfo6 = Lfo::new(sample_rate);
+        self.scene_lfo1.reset();
+        self.scene_lfo2.reset();
+        self.scene_lfo3.reset();
+        self.scene_lfo4.reset();
+        self.scene_lfo5.reset();
+        self.scene_lfo6.reset();
     }
 
     pub fn set_max_voices(&mut self, max_voices: usize) {
         self.max_voices = max_voices.max(1);
         if self.voices.len() < self.max_voices {
+            let pitch_bend = self.pitch_bend;
             for _ in self.voices.len()..self.max_voices {
-                self.voices.push(Voice::new(self.sample_rate));
+                let mut voice = Voice::new(self.sample_rate);
+                voice.pitch_bend = pitch_bend;
+                self.voices.push(voice);
             }
+            self.sync_voice_wavetables();
         }
     }
 
@@ -84,11 +136,46 @@ impl SynthEngine {
         self.mts_esp = client;
     }
 
+    /// Resolve the active wavetable for an oscillator: factory tables for
+    /// param values `0..FACTORY_COUNT`, the custom file table otherwise.
+    fn resolve_wavetable(&self, osc_index: usize) -> Option<Arc<Wavetable>> {
+        let select = self.params.oscs[osc_index].wavetable_select as usize;
+        if select >= FACTORY_COUNT {
+            self.custom_wavetables[osc_index].clone()
+        } else {
+            factory_table(select)
+        }
+    }
+
+    fn sync_voice_wavetables(&mut self) {
+        let resolved = [
+            self.resolve_wavetable(0),
+            self.resolve_wavetable(1),
+            self.resolve_wavetable(2),
+        ];
+        for voice in &mut self.voices {
+            for (idx, table) in resolved.iter().cloned().enumerate() {
+                voice.set_wavetable(idx, table);
+            }
+        }
+    }
+
+    /// Install a custom wavetable (from a user file) for an oscillator,
+    /// applying it to existing voices. Factory selections ignore it.
+    pub fn set_wavetable(&mut self, osc_index: usize, wavetable: Option<Arc<Wavetable>>) {
+        if osc_index >= self.custom_wavetables.len() {
+            return;
+        }
+        self.custom_wavetables[osc_index] = wavetable;
+        self.sync_voice_wavetables();
+    }
+
     pub fn update_params(&mut self) {
         for voice in &mut self.voices {
             voice.set_params(&self.params);
             voice.set_mts_esp(self.mts_esp.clone());
         }
+        self.sync_voice_wavetables();
 
         self.update_scene_lfos();
     }
@@ -143,6 +230,7 @@ impl SynthEngine {
         for voice in &mut self.voices {
             voice.update_osc_params(&self.params);
         }
+        self.sync_voice_wavetables();
     }
 
     pub fn update_amp_eg_params(&mut self) {
@@ -282,18 +370,14 @@ impl SynthEngine {
 
         if let Some(idx) = self.find_voice_playing_note(note) {
             if self.params.poly_repeated_key_mode {
-                if let Some(steal_idx) = self.find_voice_to_steal() {
-                    self.voices[steal_idx].trigger(note, velocity);
-                }
+                self.steal_voice(note, velocity);
             } else {
                 self.voices[idx].trigger(note, velocity);
             }
             return;
         }
 
-        if let Some(idx) = self.find_voice_to_steal() {
-            self.voices[idx].trigger(note, velocity);
-        }
+        self.steal_voice(note, velocity);
     }
 
     fn trigger_mono(&mut self, note: u8, velocity: f32, legato: bool) {
@@ -441,9 +525,7 @@ impl SynthEngine {
             self.voices[idx].trigger(note, velocity);
             return;
         }
-        if let Some(idx) = self.find_voice_to_steal() {
-            self.voices[idx].trigger(note, velocity);
-        }
+        self.steal_voice(note, velocity);
     }
 
     fn trigger_poly_stack_multiple(&mut self, note: u8, velocity: f32) {
@@ -451,9 +533,7 @@ impl SynthEngine {
             self.voices[idx].trigger(note, velocity);
             return;
         }
-        if let Some(idx) = self.find_voice_to_steal() {
-            self.voices[idx].trigger(note, velocity);
-        }
+        self.steal_voice(note, velocity);
     }
 
     fn release_poly_stack_multiple(&mut self, note: u8, velocity: f32) {
@@ -540,6 +620,7 @@ impl SynthEngine {
     }
 
     pub fn set_pitch_bend(&mut self, bend: f32) {
+        self.pitch_bend = bend;
         for voice in &mut self.voices {
             voice.pitch_bend = bend;
         }
@@ -608,9 +689,10 @@ impl SynthEngine {
     }
 
     pub fn set_note_tuning(&mut self, note: u8, cents: f32) {
+        let bend_range = self.params.pitch_bend_range.max(0.01);
         for voice in &mut self.voices {
             if voice.note == note && voice.is_active() {
-                voice.pitch_bend = cents / 100.0 / self.params.pitch_bend_range;
+                voice.pitch_bend = cents / 100.0 / bend_range;
             }
         }
     }
@@ -684,13 +766,32 @@ impl SynthEngine {
             self.temp_r.resize(frames, 0.0);
         }
 
-        let scene_lfo_outputs = [
-            self.scene_lfo1.next(),
-            self.scene_lfo2.next(),
-            self.scene_lfo3.next(),
-            self.scene_lfo4.next(),
-            self.scene_lfo5.next(),
-            self.scene_lfo6.next(),
+        let scene_lfo_bufs = &mut self.scene_lfo_bufs;
+        let scene_lfos = [
+            &mut self.scene_lfo1,
+            &mut self.scene_lfo2,
+            &mut self.scene_lfo3,
+            &mut self.scene_lfo4,
+            &mut self.scene_lfo5,
+            &mut self.scene_lfo6,
+        ];
+        // Advance the scene LFOs exactly once per output sample, even when no
+        // voices are active, so they keep time regardless of voice count.
+        for (buf, lfo) in scene_lfo_bufs.iter_mut().zip(scene_lfos) {
+            if buf.len() < frames {
+                buf.resize(frames, 0.0);
+            }
+            for sample in buf[..frames].iter_mut() {
+                *sample = lfo.next();
+            }
+        }
+        let scene_lfo_slices = [
+            scene_lfo_bufs[0].as_slice(),
+            scene_lfo_bufs[1].as_slice(),
+            scene_lfo_bufs[2].as_slice(),
+            scene_lfo_bufs[3].as_slice(),
+            scene_lfo_bufs[4].as_slice(),
+            scene_lfo_bufs[5].as_slice(),
         ];
 
         let mut lowest_key = 60;
@@ -720,7 +821,6 @@ impl SynthEngine {
             }
             active_voice_count += 1;
 
-            voice.set_scene_lfo_outputs(scene_lfo_outputs);
             voice.set_key_mod_values(lowest_key_norm, highest_key_norm, latest_key_norm);
 
             self.temp_l[..frames].fill(0.0);
@@ -730,6 +830,7 @@ impl SynthEngine {
                 &mut self.temp_r[..frames],
                 audio_in_l,
                 audio_in_r,
+                &scene_lfo_slices,
             );
 
             for i in 0..frames {
@@ -753,6 +854,27 @@ impl SynthEngine {
                 }
             }
         }
+
+        // Final clip protection on the summed master output: stacked voices
+        // and drive stages can push the sum past ±1, so run every output
+        // sample through the knee clipper (transparent below the knee).
+        for i in 0..frames {
+            out_l[i] = soft_clip_master(out_l[i]);
+            out_r[i] = soft_clip_master(out_r[i]);
+        }
+
+        // Reclaim voices that temporarily exceeded the pool for an uber
+        // release once they are fully faded. This also drops inactive pool
+        // voices when `set_max_voices` shrank the pool.
+        let mut overflow = self.voices.len().saturating_sub(self.max_voices);
+        self.voices.retain(|v| {
+            if v.is_active() || overflow == 0 {
+                true
+            } else {
+                overflow -= 1;
+                false
+            }
+        });
     }
 
     pub fn visual_lfo_mod_values(&self) -> &[[f32; ModTarget::COUNT as usize]; 6] {
@@ -769,6 +891,38 @@ impl SynthEngine {
 
     fn find_voice_playing_note(&self, note: u8) -> Option<usize> {
         self.voices.iter().position(|v| v.note == note && v.gate)
+    }
+
+    /// Steal a voice for `note`: the victim enters the uber release (fast
+    /// fade instead of a hard cut) while the new note gets a fresh voice
+    /// appended to the pool. Overflow voices are reclaimed in `process_block`
+    /// once their uber release finishes.
+    fn steal_voice(&mut self, note: u8, velocity: f32) {
+        let Some(idx) = self.find_voice_to_steal() else {
+            return;
+        };
+        self.voices[idx].begin_uber_release();
+
+        let mut voice = Voice::new(self.sample_rate);
+        voice.pitch_bend = self.pitch_bend;
+        if let Some(template) = self.voices.first() {
+            let tempo_bpm = template.tempo_bpm;
+            voice.tempo_bpm = tempo_bpm;
+            voice.lfo1.set_tempo(tempo_bpm);
+            voice.lfo2.set_tempo(tempo_bpm);
+            voice.lfo3.set_tempo(tempo_bpm);
+            voice.lfo4.set_tempo(tempo_bpm);
+            voice.lfo5.set_tempo(tempo_bpm);
+            voice.lfo6.set_tempo(tempo_bpm);
+            voice.set_eg_tempo(tempo_bpm);
+        }
+        voice.set_params(&self.params);
+        voice.set_mts_esp(self.mts_esp.clone());
+        for idx in 0..3 {
+            voice.set_wavetable(idx, self.resolve_wavetable(idx));
+        }
+        voice.trigger(note, velocity);
+        self.voices.push(voice);
     }
 
     fn find_voice_to_steal(&self) -> Option<usize> {

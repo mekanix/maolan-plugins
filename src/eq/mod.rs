@@ -1,6 +1,6 @@
 pub mod dsp;
 pub mod gui;
-pub mod halfband;
+
 pub mod linear_phase;
 pub mod params;
 pub mod plugin;

@@ -192,6 +192,9 @@ pub struct PluginState {
     pub sampler_instrument_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampler_sf2_preset: Option<usize>,
+    /// Per-oscillator (0..2) custom wavetable file paths for the synth.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wavetable_paths: Vec<(u8, String)>,
 }
 
 impl PluginState {
@@ -209,6 +212,7 @@ impl PluginState {
             sampler_groups: None,
             sampler_instrument_path: None,
             sampler_sf2_preset: None,
+            wavetable_paths: Vec::new(),
         }
     }
 

@@ -33,7 +33,7 @@ use portable_atomic::{AtomicF32, AtomicF64};
 
 use crate::common::copy_str_to_array;
 use crate::common::param_events::ParamGesture;
-use crate::common::{bus, fft};
+use crate::common::{bus, fft, wavetable::Wavetable, wavetable_factory::FACTORY_COUNT};
 use crate::synth::{
     dsp::{
         AttackShape, CombinatorMode, DecayReleaseShape, EnvelopeMode, EnvelopeRetriggerMode,
@@ -97,6 +97,10 @@ pub struct SharedState {
     visual_lfo_mod_values: Vec<AtomicF32>,
     pub poll_notifier: Mutex<Option<maolan_baseview::iced::PollSubNotifier>>,
     host: AtomicPtr<clap_host>,
+    /// GUI -> audio thread handoff of custom wavetables (per oscillator).
+    pub custom_wavetables: [Mutex<Option<Arc<Wavetable>>>; 3],
+    /// Persisted custom wavetable file paths (per oscillator).
+    pub custom_wavetable_paths: [Mutex<Option<String>>; 3],
 }
 
 impl Default for SharedState {
@@ -128,6 +132,8 @@ impl Default for SharedState {
                 .collect(),
             poll_notifier: Mutex::new(None),
             host: AtomicPtr::new(null_mut()),
+            custom_wavetables: [const { Mutex::new(None) }; 3],
+            custom_wavetable_paths: [const { Mutex::new(None) }; 3],
         }
     }
 }
@@ -135,6 +141,21 @@ impl Default for SharedState {
 impl SharedState {
     fn set_host(&self, host: *const clap_host) {
         self.host.store(host.cast_mut(), Ordering::Release);
+    }
+
+    /// Store a custom wavetable for an oscillator, loaded by the GUI off the
+    /// audio thread. The audio processor picks it up on the next process call.
+    pub fn set_custom_wavetable(
+        &self,
+        osc_index: usize,
+        wavetable: Option<Arc<Wavetable>>,
+        path: Option<String>,
+    ) {
+        if osc_index >= self.custom_wavetables.len() {
+            return;
+        }
+        *self.custom_wavetables[osc_index].lock() = wavetable;
+        *self.custom_wavetable_paths[osc_index].lock() = path;
     }
 
     fn set_sample_rate(&self, sample_rate: f64) {
@@ -1287,6 +1308,7 @@ fn build_osc_params(params: &mut VoiceParams, store: &ParamStore, idx: usize) {
                 route: OscRoute::from_u8(store.get(ParamId::Osc1Route) as u8),
                 mute: store.get_bool(ParamId::Osc1Mute),
                 solo: store.get_bool(ParamId::Osc1Solo),
+                wavetable_select: store.get(ParamId::Osc1Wavetable) as u8,
             };
         }
         1 => {
@@ -1355,6 +1377,7 @@ fn build_osc_params(params: &mut VoiceParams, store: &ParamStore, idx: usize) {
                 route: OscRoute::from_u8(store.get(ParamId::Osc2Route) as u8),
                 mute: store.get_bool(ParamId::Osc2Mute),
                 solo: store.get_bool(ParamId::Osc2Solo),
+                wavetable_select: store.get(ParamId::Osc2Wavetable) as u8,
             };
         }
         2 => {
@@ -1423,6 +1446,7 @@ fn build_osc_params(params: &mut VoiceParams, store: &ParamStore, idx: usize) {
                 route: OscRoute::from_u8(store.get(ParamId::Osc3Route) as u8),
                 mute: store.get_bool(ParamId::Osc3Mute),
                 solo: store.get_bool(ParamId::Osc3Solo),
+                wavetable_select: store.get(ParamId::Osc3Wavetable) as u8,
             };
         }
         _ => {}
@@ -1520,6 +1544,7 @@ fn build_misc_globals_params(params: &mut VoiceParams, store: &ParamStore) {
     params.sh_noise_correlation = store.get(ParamId::ShNoiseCorrelation) as f32;
     params.sh_noise_width = store.get(ParamId::ShNoiseWidth) as f32;
     params.sh_noise_sync = store.get(ParamId::ShNoiseSync) as f32;
+    params.voice_oversample = store.get_bool(ParamId::Oversample);
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -1567,6 +1592,7 @@ fn apply_param_id_to_voice_params(
         | ParamId::Osc1Unison
         | ParamId::Osc1UnisonDetune
         | ParamId::Osc1UnisonSpread
+        | ParamId::Osc1Wavetable
         | ParamId::Osc1PhaseMode
         | ParamId::Osc1Sync
         | ParamId::Osc1Waveform
@@ -1597,6 +1623,7 @@ fn apply_param_id_to_voice_params(
         | ParamId::Osc2Unison
         | ParamId::Osc2UnisonDetune
         | ParamId::Osc2UnisonSpread
+        | ParamId::Osc2Wavetable
         | ParamId::Osc2PhaseMode
         | ParamId::Osc2Sync
         | ParamId::Osc2Waveform
@@ -1628,6 +1655,7 @@ fn apply_param_id_to_voice_params(
         | ParamId::Osc3Unison
         | ParamId::Osc3UnisonDetune
         | ParamId::Osc3UnisonSpread
+        | ParamId::Osc3Wavetable
         | ParamId::Osc3PhaseMode
         | ParamId::Osc3Sync
         | ParamId::Osc3Waveform
@@ -2476,7 +2504,8 @@ fn apply_param_id_to_voice_params(
         | ParamId::TwistLpgDecay
         | ParamId::ShNoiseCorrelation
         | ParamId::ShNoiseWidth
-        | ParamId::ShNoiseSync => {
+        | ParamId::ShNoiseSync
+        | ParamId::Oversample => {
             build_misc_globals_params(params, store);
             dirty.misc_globals = true;
             true
@@ -2495,15 +2524,50 @@ fn apply_param_id_to_voice_params(
         | ParamId::Reserved258
         | ParamId::Reserved259
         | ParamId::Reserved260
-        | ParamId::Reserved712
-        | ParamId::Reserved713
-        | ParamId::Reserved714
-        | ParamId::Reserved715
         | ParamId::Reserved716
         | ParamId::Reserved717
         | ParamId::Reserved718
         | ParamId::Reserved719 => true,
     }
+}
+
+/// Enable FTZ (flush to zero) and DAZ (denormals are zero) on the current
+/// x86-64 thread by setting bits 15 and 6 of MXCSR. This only affects the
+/// current thread's FP state; the out-of-process plugin host dedicates this
+/// thread to this plugin, so the host's own FP handling is unaffected. Std
+/// does not expose the DAZ intrinsics and deprecates the FTZ setters, so the
+/// CSR is updated with `stmxcsr`/`ldmxcsr` directly.
+#[cfg(target_arch = "x86_64")]
+fn enable_ftz_daz() {
+    const MXCSR_FTZ: u32 = 1 << 15;
+    const MXCSR_DAZ: u32 = 1 << 6;
+    let mut mxcsr: u32 = 0;
+    // SAFETY: `mxcsr` is a valid, aligned u32 stack slot and both
+    // instructions only read/write the current thread's MXCSR through its
+    // address.
+    unsafe {
+        core::arch::asm!(
+            "stmxcsr [{}]",
+            in(reg) &mut mxcsr,
+            options(nostack, preserves_flags)
+        );
+        mxcsr |= MXCSR_FTZ | MXCSR_DAZ;
+        core::arch::asm!(
+            "ldmxcsr [{}]",
+            in(reg) &mxcsr,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// A note/CC event from the host's input event list, tagged with its
+/// sample offset within the processing block so it can be applied at the
+/// exact sample position (sample-accurate timing).
+enum TimedEvent {
+    NoteOn { key: u8, velocity: f32 },
+    NoteOff { key: u8, velocity: f32 },
+    NoteExpression { key: u8, expr_id: u32, value: f32 },
+    Midi { data: [u8; 3] },
 }
 
 struct AudioProcessor {
@@ -2582,7 +2646,67 @@ impl AudioProcessor {
 
     fn reset(&mut self) {}
 
+    /// Apply one collected note/CC event to the engine. Called at the
+    /// event's sample offset while rendering a segmented block.
+    fn apply_timed_event(&mut self, event: &TimedEvent) {
+        match event {
+            TimedEvent::NoteOn { key, velocity } => self.engine.trigger(*key, *velocity),
+            TimedEvent::NoteOff { key, velocity } => self.engine.release(*key, *velocity),
+            TimedEvent::NoteExpression {
+                key,
+                expr_id,
+                value,
+            } => {
+                if *expr_id == CLAP_NOTE_EXPRESSION_PRESSURE as u32 {
+                    self.engine.set_note_pressure(*key, *value);
+                } else if *expr_id == CLAP_NOTE_EXPRESSION_TUNING as u32 {
+                    self.engine.set_note_tuning(*key, *value * 100.0);
+                } else if *expr_id == CLAP_NOTE_EXPRESSION_BRIGHTNESS as u32 {
+                    self.engine.set_note_timbre(*key, *value);
+                } else if *expr_id == CLAP_NOTE_EXPRESSION_VOLUME as u32 {
+                    self.engine.set_note_volume(*key, *value);
+                } else if *expr_id == CLAP_NOTE_EXPRESSION_PAN as u32 {
+                    self.engine.set_note_pan(*key, *value * 2.0 - 1.0);
+                }
+            }
+            TimedEvent::Midi { data } => {
+                let status = data[0] & 0xF0;
+                match status {
+                    0xB0 => {
+                        let cc = data[1];
+                        let value = data[2] as f32 / 127.0;
+                        match cc {
+                            1 => self.engine.set_mod_wheel(value),
+                            2 => self.engine.set_breath(value),
+                            11 => self.engine.set_expression(value),
+                            64 => self.engine.set_sustain(value),
+                            _ => {}
+                        }
+                    }
+                    0xD0 => {
+                        let value = data[1] as f32 / 127.0;
+                        self.engine.set_aftertouch(value);
+                    }
+                    0xE0 => {
+                        let bend = (data[2] as f32 * 128.0 + data[1] as f32) / 8192.0 - 1.0;
+                        self.engine.set_pitch_bend(bend);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     fn process(&mut self, shared: &SharedState, process: &mut Process) -> clap_process_status {
+        // Flush denormals to zero for this audio call: the synth's IIR
+        // filters and feedback loops can otherwise stall on denormal
+        // operands. This only touches the current thread's FP state (MXCSR
+        // FTZ/DAZ bits); the out-of-process host dedicates this thread to
+        // this plugin and its own code is not running mid-call. Non-x86
+        // targets: no-op.
+        #[cfg(target_arch = "x86_64")]
+        enable_ftz_daz();
+
         let mut changed_params: [Option<(ParamId, f64)>; 32] = [None; 32];
         let mut overflow = apply_param_events_synth(
             shared,
@@ -2725,6 +2849,14 @@ impl AudioProcessor {
             self.last_params_version = params_version;
         }
 
+        // Pick up custom wavetables loaded by the GUI (off the audio thread).
+        for osc_index in 0..3 {
+            let wavetable = shared.custom_wavetables[osc_index].lock().take();
+            if let Some(wavetable) = wavetable {
+                self.engine.set_wavetable(osc_index, Some(wavetable));
+            }
+        }
+
         if let Some(transport) = process.transport() {
             let tempo = transport.tempo() as f32;
             if tempo > 0.0 {
@@ -2734,6 +2866,11 @@ impl AudioProcessor {
                 .set_song_pos_beats(transport.song_pos_beats().0 as f64 / (1i64 << 31) as f64);
         }
 
+        let frames = process.frames_count() as usize;
+
+        // Collect note/CC events with their sample offsets so they can be
+        // applied at the exact sample position instead of at block start.
+        let mut timed_events: Vec<(u32, TimedEvent)> = Vec::new();
         let events = process.in_events();
         for i in 0..events.size() {
             let header = unsafe { events.get_unchecked(i) };
@@ -2741,13 +2878,14 @@ impl AudioProcessor {
                 continue;
             }
             let evt_type = header.r#type() as u32;
+            let time = header.time();
             match evt_type {
                 CLAP_EVENT_NOTE_ON => {
                     if let Ok(note) = header.note() {
                         let velocity = note.velocity() as f32;
                         let key = note.key() as u8;
                         if velocity > 0.0 {
-                            self.engine.trigger(key, velocity);
+                            timed_events.push((time, TimedEvent::NoteOn { key, velocity }));
                         }
                     }
                 }
@@ -2755,7 +2893,7 @@ impl AudioProcessor {
                     if let Ok(note) = header.note() {
                         let key = note.key() as u8;
                         let velocity = note.velocity() as f32;
-                        self.engine.release(key, velocity);
+                        timed_events.push((time, TimedEvent::NoteOff { key, velocity }));
                     }
                 }
                 CLAP_EVENT_NOTE_EXPRESSION => {
@@ -2765,48 +2903,28 @@ impl AudioProcessor {
                         let key = expr.key() as u8;
                         let value = expr.value() as f32;
                         let expr_id = expr.expression_id() as u32;
-                        if expr_id == CLAP_NOTE_EXPRESSION_PRESSURE as u32 {
-                            self.engine.set_note_pressure(key, value);
-                        } else if expr_id == CLAP_NOTE_EXPRESSION_TUNING as u32 {
-                            self.engine.set_note_tuning(key, value * 100.0);
-                        } else if expr_id == CLAP_NOTE_EXPRESSION_BRIGHTNESS as u32 {
-                            self.engine.set_note_timbre(key, value);
-                        } else if expr_id == CLAP_NOTE_EXPRESSION_VOLUME as u32 {
-                            self.engine.set_note_volume(key, value);
-                        } else if expr_id == CLAP_NOTE_EXPRESSION_PAN as u32 {
-                            self.engine.set_note_pan(key, value * 2.0 - 1.0);
-                        }
+                        timed_events.push((
+                            time,
+                            TimedEvent::NoteExpression {
+                                key,
+                                expr_id,
+                                value,
+                            },
+                        ));
                     }
                 }
                 CLAP_EVENT_MIDI => {
                     if let Ok(midi) = header.midi() {
-                        let data = midi.data();
-                        let status = data[0] & 0xF0;
-                        match status {
-                            0xB0 => {
-                                let cc = data[1];
-                                let value = data[2] as f32 / 127.0;
-                                match cc {
-                                    1 => self.engine.set_mod_wheel(value),
-                                    2 => self.engine.set_breath(value),
-                                    11 => self.engine.set_expression(value),
-                                    64 => self.engine.set_sustain(value),
-                                    _ => {}
-                                }
-                            }
-                            0xD0 => {
-                                let value = data[1] as f32 / 127.0;
-                                self.engine.set_aftertouch(value);
-                            }
-                            _ => {}
-                        }
+                        timed_events.push((time, TimedEvent::Midi { data: *midi.data() }));
                     }
                 }
                 _ => {}
             }
         }
+        // The CLAP spec requires hosts to deliver events sorted by time, but
+        // sort anyway (stable, so same-offset events keep their order).
+        timed_events.sort_by_key(|(time, _)| *time);
 
-        let frames = process.frames_count() as usize;
         if self.temp_l.len() < frames {
             self.temp_l.resize(frames, 0.0);
             self.temp_r.resize(frames, 0.0);
@@ -2833,12 +2951,32 @@ impl AudioProcessor {
             (None, None)
         };
 
-        self.engine.process_block(
-            &mut self.temp_l[..frames],
-            &mut self.temp_r[..frames],
-            audio_in_l,
-            audio_in_r,
-        );
+        // Render the block in segments split at event offsets: a note/CC
+        // event at offset N applies exactly at sample N instead of at block
+        // start. Events sharing an offset apply together before the segment
+        // following them is rendered.
+        let mut seg_start = 0usize;
+        for (time, event) in &timed_events {
+            let offset = (*time as usize).min(frames);
+            if offset > seg_start {
+                self.engine.process_block(
+                    &mut self.temp_l[seg_start..offset],
+                    &mut self.temp_r[seg_start..offset],
+                    audio_in_l.map(|s| &s[seg_start..offset]),
+                    audio_in_r.map(|s| &s[seg_start..offset]),
+                );
+            }
+            self.apply_timed_event(event);
+            seg_start = offset;
+        }
+        if seg_start < frames {
+            self.engine.process_block(
+                &mut self.temp_l[seg_start..frames],
+                &mut self.temp_r[seg_start..frames],
+                audio_in_l.map(|s| &s[seg_start..frames]),
+                audio_in_r.map(|s| &s[seg_start..frames]),
+            );
+        }
         shared.set_visual_lfo_mod_values(self.engine.visual_lfo_mod_values());
         if let Some(ref notifier) = *shared.poll_notifier.lock() {
             notifier.notify();
@@ -3237,7 +3375,12 @@ unsafe extern "C-unwind" fn ext_state_save(
         return false;
     }
     let inst = unsafe { instance(plugin) };
-    let state = PluginState::from_runtime(&inst.shared.params);
+    let mut state = PluginState::from_runtime(&inst.shared.params);
+    for (osc_index, path_slot) in inst.shared.custom_wavetable_paths.iter().enumerate() {
+        if let Some(path) = path_slot.lock().as_ref() {
+            state.wavetable_paths.push((osc_index as u8, path.clone()));
+        }
+    }
     let Ok(bytes) = state.to_bytes() else {
         return false;
     };
@@ -3262,6 +3405,35 @@ unsafe extern "C-unwind" fn ext_state_load(
         return false;
     };
     state.apply(&inst.shared.params);
+
+    // Restore custom wavetables referenced by this patch. Loading happens on
+    // the host state-load thread, never inside process().
+    for (osc_index, path) in &state.wavetable_paths {
+        let osc_index = *osc_index as usize;
+        if osc_index >= 3 {
+            continue;
+        }
+        let path_buf = std::path::Path::new(path);
+        match Wavetable::from_file_any(path_buf) {
+            Ok(wavetable) => {
+                inst.shared.set_custom_wavetable(
+                    osc_index,
+                    Some(Arc::new(wavetable)),
+                    Some(path.clone()),
+                );
+            }
+            Err(_) => {
+                inst.shared.set_custom_wavetable(osc_index, None, None);
+            }
+        }
+        let select_id = match osc_index {
+            0 => ParamId::Osc1Wavetable,
+            1 => ParamId::Osc2Wavetable,
+            _ => ParamId::Osc3Wavetable,
+        };
+        inst.shared.params.set(select_id, FACTORY_COUNT as f64);
+    }
+
     inst.shared.bump_params_version();
     true
 }

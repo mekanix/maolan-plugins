@@ -597,7 +597,7 @@ fn auto_gain_off_applies_unity_compensation() {
 
 // ---- Phase 6: linear phase, character, latency reporting ----
 
-use maolan_plugins::eq::halfband::HALFBAND_LATENCY;
+use maolan_plugins::common::halfband::HALFBAND_LATENCY;
 use maolan_plugins::eq::linear_phase::{BandDesign, LP_LATENCY, LinearPhaseEq};
 use maolan_plugins::eq::params::{PARAMS, ParamId, ParamStore};
 use maolan_plugins::eq::plugin as eq_plugin;
