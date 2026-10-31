@@ -39,7 +39,7 @@ use crate::{
         wavetable_factory::{CUSTOM_WAVETABLE_LABEL, FACTORY_COUNT, FACTORY_NAMES},
     },
     synth::{
-        dsp::{ClassicWaveform, LfoShape, ModTarget, ModernSubWaveform, OscType},
+        dsp::{LfoShape, ModTarget, OscType},
         params::{ParamDef, ParamId, param_def},
         plugin::SharedState,
     },
@@ -119,7 +119,6 @@ pub enum Message {
     SelectMisc(usize),
     SelectRouting(usize),
     PickWavetableFile(usize),
-    PickSurgePreset,
     SaveSynthPreset,
     OpenSynthPreset,
 }
@@ -238,28 +237,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     state
                         .shared
                         .set_param_outbound_only(id, FACTORY_COUNT as f64);
-                }
-            }
-        }
-        Message::PickSurgePreset => {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Surge XT presets", &["fxp"])
-                .pick_file()
-            {
-                match state.shared.load_surge_preset(&path) {
-                    Ok(()) => {
-                        let name = file_stem_display(&path);
-                        let report = state.shared.surge_report.lock();
-                        let skipped = report.skipped.len();
-                        let errors = report.errors.len();
-                        let notes = report.notes.len();
-                        state.preset_status = Some(format!(
-                            "Imported {name}: {skipped} skipped, {errors} errors, {notes} notes"
-                        ));
-                    }
-                    Err(error) => {
-                        state.preset_status = Some(format!("Import failed: {error}"));
-                    }
                 }
             }
         }
@@ -487,10 +464,6 @@ fn mod_target_for_param(id: ParamId) -> Option<ModTarget> {
         ParamId::FilterDecay => Some(ModTarget::FilterDecay),
         ParamId::FilterSustain => Some(ModTarget::FilterSustain),
         ParamId::FilterRelease => Some(ModTarget::FilterRelease),
-        ParamId::PitchAttack => Some(ModTarget::PitchAttack),
-        ParamId::PitchDecay => Some(ModTarget::PitchDecay),
-        ParamId::PitchSustain => Some(ModTarget::PitchSustain),
-        ParamId::PitchRelease => Some(ModTarget::PitchRelease),
         ParamId::Volume => Some(ModTarget::OutputVolume),
         ParamId::Pan => Some(ModTarget::OutputPan),
         ParamId::Width => Some(ModTarget::OutputWidth),
@@ -616,73 +589,122 @@ fn osc_type_dropdown<'a>(id: ParamId, state: &'a State) -> Element<'a, Message> 
     .placeholder("Type")
     .width(Length::Fixed(84.0));
 
-    container(
-        column![text("Type").size(11), dropdown]
-            .spacing(2)
-            .align_x(Alignment::Center),
-    )
-    .width(Length::Fixed(90.0))
-    .into()
+    container(dropdown).width(Length::Fixed(90.0)).into()
 }
 
 fn waveform_dropdown<'a>(state: &'a State, osc_index: usize) -> Element<'a, Message> {
-    let (type_id, wave_id) = match osc_index {
-        0 => (ParamId::Osc1Type, ParamId::Osc1Waveform),
-        1 => (ParamId::Osc2Type, ParamId::Osc2Waveform),
-        _ => (ParamId::Osc3Type, ParamId::Osc3Waveform),
+    let (type_id, wave_id, shape_id) = match osc_index {
+        0 => (ParamId::Osc1Type, ParamId::Osc1Waveform, ParamId::Osc1Shape),
+        1 => (ParamId::Osc2Type, ParamId::Osc2Waveform, ParamId::Osc2Shape),
+        _ => (ParamId::Osc3Type, ParamId::Osc3Waveform, ParamId::Osc3Shape),
     };
     let osc_type = OscType::from_u8(state.shared.params.get(type_id) as u8);
-    let value = state.shared.params.get(wave_id) as f32;
+    let options: Vec<&'static str> = match osc_type {
+        OscType::Classic => vec!["Saw", "Square", "Pulse", "Triangle", "Sine"],
+        OscType::Sine => vec!["Sine"],
+        OscType::Fm2 => vec!["2-Operator Sine FM"],
+        OscType::Wavetable => vec!["Selected Wavetable"],
+        OscType::Window => vec![
+            "Sine Window",
+            "Hann Window",
+            "Hamming Window",
+            "Blackman Window",
+            "Triangle Window",
+            "Cosine Window",
+            "Saw Window",
+            "Square Window",
+            "Rectangle Window",
+        ],
+        OscType::Modern => vec!["Sub Square", "Sub Triangle", "Sub Saw"],
+        OscType::ShNoise => vec!["Sample & Hold Noise"],
+        OscType::String => vec![
+            "Noise Exciter",
+            "Impulse Exciter",
+            "Pluck",
+            "Hammer",
+            "Bow",
+            "Pink Noise Exciter",
+            "Sine Burst",
+            "Ramp Burst",
+            "Triangle Burst",
+            "Square Burst",
+            "Sweep Burst",
+            "Long Noise",
+            "Long Pink Noise",
+            "Half Sine",
+            "Two Sines",
+            "Cosine Burst",
+        ],
+        OscType::Fm3 => vec!["3-Operator Sine FM"],
+        OscType::Alias => vec![
+            "Saw",
+            "Sine",
+            "Pulse",
+            "Triangle",
+            "Noise",
+            "Square",
+            "TX2 Rectified",
+            "TX3 Half-Rectified",
+            "TX4 Squared",
+            "TX5 Cubed",
+            "TX6 Absolute Squared",
+            "TX7 Absolute Cubed",
+            "TX8 Saw Blend",
+            "16-Partial Additive",
+            "Ramp",
+            "Alias Memory",
+        ],
+        OscType::Twist => vec![
+            "Virtual Analog",
+            "Wavefolder",
+            "2-Operator FM",
+            "Harmonic",
+            "String",
+            "Noise",
+            "Chords",
+            "Filtered Noise",
+            "Analog Kick",
+            "Analog Snare",
+            "Vowels",
+            "Granular Cloud",
+            "Inharmonic String",
+            "Modal Resonator",
+            "Particle Noise",
+            "Analog Hi-Hat",
+        ],
+        OscType::AudioInput => vec!["Audio Input"],
+        OscType::Sample => vec!["Sample"],
+    };
+    let is_twist = osc_type == OscType::Twist;
+    let (control_id, selected_index) = if is_twist {
+        let shape = state.shared.params.get(shape_id) as f32;
+        (shape_id, ((shape.clamp(0.0, 1.0) * 16.0) as usize).min(15))
+    } else {
+        (wave_id, state.shared.params.get(wave_id) as usize)
+    };
+    let selected_index = if options.len() == 1 {
+        0
+    } else {
+        selected_index
+    };
+    let selected = options.get(selected_index).copied();
+    let callback_options = options.clone();
+    let dropdown = maolan_baseview::iced::widget::pick_list(options, selected, move |name| {
+        let index = callback_options
+            .iter()
+            .position(|&option| option == name)
+            .unwrap_or(0);
+        let value = if is_twist {
+            index as f32 / 16.0
+        } else {
+            index as f32
+        };
+        Message::SetParam(control_id, value)
+    })
+    .placeholder("Wave")
+    .width(Length::Fixed(120.0));
 
-    match osc_type {
-        OscType::Classic => {
-            let waveform = ClassicWaveform::from_u8(value as u8);
-            let options = vec![
-                ClassicWaveform::Saw,
-                ClassicWaveform::Square,
-                ClassicWaveform::Pulse,
-                ClassicWaveform::Triangle,
-                ClassicWaveform::Sine,
-            ];
-            let dropdown =
-                maolan_baseview::iced::widget::pick_list(options, Some(waveform), move |t| {
-                    Message::SetParam(wave_id, t as u8 as f32)
-                })
-                .placeholder("Wave")
-                .width(Length::Fixed(84.0));
-
-            container(
-                column![text("Wave").size(11), dropdown]
-                    .spacing(2)
-                    .align_x(Alignment::Center),
-            )
-            .width(Length::Fixed(90.0))
-            .into()
-        }
-        OscType::Modern => {
-            let waveform = ModernSubWaveform::from_u8(value as u8);
-            let options = vec![
-                ModernSubWaveform::Square,
-                ModernSubWaveform::Triangle,
-                ModernSubWaveform::Saw,
-            ];
-            let dropdown =
-                maolan_baseview::iced::widget::pick_list(options, Some(waveform), move |t| {
-                    Message::SetParam(wave_id, t as u8 as f32)
-                })
-                .placeholder("Wave")
-                .width(Length::Fixed(84.0));
-
-            container(
-                column![text("Wave").size(11), dropdown]
-                    .spacing(2)
-                    .align_x(Alignment::Center),
-            )
-            .width(Length::Fixed(90.0))
-            .into()
-        }
-        _ => param_control(wave_id, "Wave", state),
-    }
+    container(dropdown).width(Length::Fixed(126.0)).into()
 }
 
 /// Wavetable selector for the Wavetable and Window oscillator types. Renders
@@ -728,23 +750,49 @@ fn wavetable_dropdown<'a>(state: &'a State, osc_index: usize) -> Element<'a, Mes
     .into()
 }
 
+const FILTER_TYPES: &[FilterType] = &[
+    FilterType::Lowpass,
+    FilterType::Bandpass,
+    FilterType::Highpass,
+    FilterType::Notch,
+    FilterType::Peak,
+    FilterType::CombPos,
+    FilterType::CombNeg,
+    FilterType::Allpass,
+    FilterType::DiodeLadder,
+    FilterType::Lowpass12dB,
+    FilterType::Highpass12dB,
+    FilterType::Bandpass12dB,
+    FilterType::LowShelf,
+    FilterType::HighShelf,
+    FilterType::Bell,
+    FilterType::Notch12dB,
+    FilterType::VintageLadder,
+    FilterType::CytomicLp,
+    FilterType::CytomicHp,
+    FilterType::CytomicBp,
+    FilterType::CytomicNotch,
+    FilterType::CytomicPeak,
+    FilterType::CytomicAp,
+    FilterType::CytomicBell,
+    FilterType::CytomicLs,
+    FilterType::CytomicHs,
+    FilterType::TriPole,
+    FilterType::SampleHold,
+    FilterType::Notch24dB,
+];
+
 fn filter_type_dropdown<'a>(id: ParamId, state: &'a State) -> Element<'a, Message> {
     let value = state.shared.params.get(id) as f32;
     let filter_type = FilterType::from_u8(value as u8);
-    let options: Vec<FilterType> = (1..=48).map(FilterType::from_u8).collect();
+    let options = FILTER_TYPES.to_vec();
     let dropdown = maolan_baseview::iced::widget::pick_list(options, Some(filter_type), move |t| {
         Message::SetParam(id, t as u8 as f32)
     })
     .placeholder("Type")
     .width(Length::Fixed(84.0));
 
-    container(
-        column![text("Type").size(11), dropdown]
-            .spacing(2)
-            .align_x(Alignment::Center),
-    )
-    .width(Length::Fixed(90.0))
-    .into()
+    container(dropdown).width(Length::Fixed(90.0)).into()
 }
 
 fn lfo_shape_dropdown<'a>(id: ParamId, state: &'a State) -> Element<'a, Message> {
@@ -785,6 +833,16 @@ fn param_value_text(id: ParamId, value: f32, step: f64) -> String {
         ParamId::F1Type | ParamId::F2Type | ParamId::NoiseFilterType => {
             FilterType::from_u8(value as u8).name().to_string()
         }
+        ParamId::VoicePriority => match value as u8 {
+            0 => "Last",
+            1 => "High",
+            2 => "Low",
+            3 => "Always Latest",
+            4 => "Always Highest",
+            5 => "Always Lowest",
+            _ => "Latest / Retrigger High",
+        }
+        .to_string(),
         _ if step >= 1.0 => format!("{value:.0}"),
         _ => format!("{value:.2}"),
     }
@@ -951,15 +1009,14 @@ fn lfo_tab_button(label: &'static str, index: usize, state: &State) -> Element<'
         .into()
 }
 
-/// Synth preset import/open/save controls, rendered above the main top bar.
+/// Synth preset open/save controls, rendered above the main top bar.
 fn preset_bar<'a>(state: &'a State) -> Element<'a, Message> {
     let open_button = button(text("Open").size(11)).on_press(Message::OpenSynthPreset);
     let save_button = button(text("Save").size(11)).on_press(Message::SaveSynthPreset);
-    let import_button = button(text("Import").size(11)).on_press(Message::PickSurgePreset);
     let status_text = text(state.preset_status.as_deref().unwrap_or("")).size(11);
 
     container(
-        row![open_button, save_button, import_button, status_text]
+        row![open_button, save_button, status_text]
             .spacing(8)
             .align_y(Alignment::Center),
     )
@@ -993,24 +1050,10 @@ fn view(state: &State) -> Element<'_, Message> {
                 param_control(ParamId::Polyphony, "Poly", state),
                 param_control(ParamId::PlayMode, "Mode", state),
                 param_control(ParamId::VoicePriority, "Priority", state),
-                param_control(ParamId::Portamento, "Port", state),
+                param_control(ParamId::Portamento, "Portamento", state),
                 param_control(ParamId::PitchBendRange, "Bend", state),
+                param_control(ParamId::Oversample, "Oversample", state),
             ])
-        ),
-        panel(
-            "Scene",
-            knob_row(vec![
-                param_control(ParamId::OscDrift, "Drift", state),
-                param_control(ParamId::NoiseColor, "Noise Col", state),
-            ])
-        ),
-        panel(
-            "Global",
-            knob_row(vec![param_control(
-                ParamId::Oversample,
-                "Oversample",
-                state
-            )])
         ),
         column![
             row![
@@ -1050,10 +1093,8 @@ fn view(state: &State) -> Element<'_, Message> {
                 param_control(ParamId::Osc1UnisonDetune, "UniDet", state),
                 param_control(ParamId::Osc1Level, "Level", state),
                 param_control(ParamId::Osc1UnisonSpread, "UniSpr", state),
-                knob_column(vec![
-                    param_control(ParamId::Osc1Sync, "Sync", state),
-                    param_control(ParamId::Osc1Enabled, "On", state),
-                ]),
+                param_control(ParamId::Osc1Sync, "Sync", state),
+                param_control(ParamId::Osc1Enabled, "On", state),
             ]),
         ]
         .spacing(6)
@@ -1077,10 +1118,8 @@ fn view(state: &State) -> Element<'_, Message> {
                 param_control(ParamId::Osc2UnisonDetune, "UniDet", state),
                 param_control(ParamId::Osc2Level, "Level", state),
                 param_control(ParamId::Osc2UnisonSpread, "UniSpr", state),
-                knob_column(vec![
-                    param_control(ParamId::Osc2Sync, "Sync", state),
-                    param_control(ParamId::Osc2Enabled, "On", state),
-                ]),
+                param_control(ParamId::Osc2Sync, "Sync", state),
+                param_control(ParamId::Osc2Enabled, "On", state),
             ]),
         ]
         .spacing(6)
@@ -1104,10 +1143,8 @@ fn view(state: &State) -> Element<'_, Message> {
                 param_control(ParamId::Osc3UnisonDetune, "UniDet", state),
                 param_control(ParamId::Osc3Level, "Level", state),
                 param_control(ParamId::Osc3UnisonSpread, "UniSpr", state),
-                knob_column(vec![
-                    param_control(ParamId::Osc2Sync, "Sync", state),
-                    param_control(ParamId::Osc2Enabled, "On", state),
-                ]),
+                param_control(ParamId::Osc3Sync, "Sync", state),
+                param_control(ParamId::Osc3Enabled, "On", state),
             ]),
         ]
         .spacing(6)
@@ -1128,39 +1165,23 @@ fn view(state: &State) -> Element<'_, Message> {
         _ => osc3,
     };
 
-    let filter1 = panel_no_title(
-        column![
-            knob_row(vec![
-                filter_type_dropdown(ParamId::F1Type, state),
-                param_control(ParamId::F1Subtype, "Sub", state),
-                param_control(ParamId::F1Cutoff, "Cut", state),
-                param_control(ParamId::F1Resonance, "Res", state),
-                param_control(ParamId::F1EgAmount, "EG", state),
-                param_control(ParamId::F1KeyTrack, "Key", state),
-                param_control(ParamId::F1Drive, "Drive", state),
-            ]),
-            knob_row(vec![param_control(ParamId::F1Enabled, "On", state),]),
-        ]
-        .spacing(6)
-        .into(),
-    );
+    let filter1 = panel_no_title(knob_row(vec![
+        filter_type_dropdown(ParamId::F1Type, state),
+        param_control(ParamId::F1Cutoff, "Cut", state),
+        param_control(ParamId::F1Resonance, "Res", state),
+        param_control(ParamId::F1EgAmount, "EG", state),
+        param_control(ParamId::F1KeyTrack, "Key", state),
+        param_control(ParamId::F1Enabled, "On", state),
+    ]));
 
-    let filter2 = panel_no_title(
-        column![
-            knob_row(vec![
-                filter_type_dropdown(ParamId::F2Type, state),
-                param_control(ParamId::F2Subtype, "Sub", state),
-                param_control(ParamId::F2Cutoff, "Cut", state),
-                param_control(ParamId::F2Resonance, "Res", state),
-                param_control(ParamId::F2EgAmount, "EG", state),
-                param_control(ParamId::F2KeyTrack, "Key", state),
-                param_control(ParamId::F2Drive, "Drive", state),
-            ]),
-            knob_row(vec![param_control(ParamId::F2Enabled, "On", state),]),
-        ]
-        .spacing(6)
-        .into(),
-    );
+    let filter2 = panel_no_title(knob_row(vec![
+        filter_type_dropdown(ParamId::F2Type, state),
+        param_control(ParamId::F2Cutoff, "Cut", state),
+        param_control(ParamId::F2Resonance, "Res", state),
+        param_control(ParamId::F2EgAmount, "EG", state),
+        param_control(ParamId::F2KeyTrack, "Key", state),
+        param_control(ParamId::F2Enabled, "On", state),
+    ]));
 
     let waveshaper = panel_no_title(
         column![
@@ -1195,16 +1216,6 @@ fn view(state: &State) -> Element<'_, Message> {
         ],
     );
 
-    let pitch_eg = envelope::panel(
-        state,
-        [
-            ParamId::PitchAttack,
-            ParamId::PitchDecay,
-            ParamId::PitchSustain,
-            ParamId::PitchRelease,
-        ],
-    );
-
     let filter_selector = row![
         tab_button(
             "Filter 1",
@@ -1228,15 +1239,14 @@ fn view(state: &State) -> Element<'_, Message> {
     let eg_selector = row![
         tab_button("Amp", state.selected_eg == 0, Message::SelectEg(0)),
         tab_button("Filter", state.selected_eg == 1, Message::SelectEg(1)),
-        tab_button("Pitch", state.selected_eg == 2, Message::SelectEg(2)),
     ]
     .spacing(4)
     .align_y(Alignment::Center);
 
-    let selected_eg_panel = match state.selected_eg {
-        0 => amp_eg,
-        1 => filter_eg,
-        _ => pitch_eg,
+    let selected_eg_panel = if state.selected_eg == 0 {
+        amp_eg
+    } else {
+        filter_eg
     };
 
     let noise = panel_no_title(
@@ -1259,24 +1269,17 @@ fn view(state: &State) -> Element<'_, Message> {
         .into(),
     );
 
-    let flavor = panel_no_title(knob_row(vec![
-        param_control(ParamId::FlavorType, "Type", state),
-        param_control(ParamId::FlavorCutoff, "Cut", state),
-        param_control(ParamId::FlavorResonance, "Res", state),
-    ]));
-
     let misc_selector = row![
         tab_button("Shaper", state.selected_misc == 0, Message::SelectMisc(0)),
         tab_button("Noise", state.selected_misc == 1, Message::SelectMisc(1)),
-        tab_button("Flavor", state.selected_misc == 2, Message::SelectMisc(2)),
     ]
     .spacing(4)
     .align_y(Alignment::Center);
 
-    let selected_misc_panel = match state.selected_misc {
-        0 => waveshaper,
-        1 => noise,
-        _ => flavor,
+    let selected_misc_panel = if state.selected_misc == 0 {
+        waveshaper
+    } else {
+        noise
     };
 
     let right_column = column![
@@ -1547,7 +1550,7 @@ impl GuiBridge {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParamId, param_value_text};
+    use super::{FILTER_TYPES, ParamId, param_value_text};
 
     #[test]
     fn octave_readout_shows_musical_offset() {
@@ -1556,5 +1559,34 @@ mod tests {
         assert_eq!(param_value_text(ParamId::Osc1Octave, 3.0, 1.0), "0");
         assert_eq!(param_value_text(ParamId::Osc1Octave, 4.0, 1.0), "1");
         assert_eq!(param_value_text(ParamId::Osc1Octave, 5.0, 1.0), "2");
+    }
+
+    #[test]
+    fn priority_readout_shows_descriptive_names() {
+        let names = [
+            "Last",
+            "High",
+            "Low",
+            "Always Latest",
+            "Always Highest",
+            "Always Lowest",
+            "Latest / Retrigger High",
+        ];
+        for (value, name) in names.into_iter().enumerate() {
+            assert_eq!(
+                param_value_text(ParamId::VoicePriority, value as f32, 1.0),
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn sub_dependent_filter_types_are_not_available() {
+        let excluded = [
+            9, 10, 11, 13, 14, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        ];
+        for id in excluded {
+            assert!(FILTER_TYPES.iter().all(|filter| *filter as u8 != id));
+        }
     }
 }

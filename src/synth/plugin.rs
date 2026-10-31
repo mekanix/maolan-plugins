@@ -112,8 +112,6 @@ pub struct SharedState {
     pub custom_wavetable_paths: [Mutex<Option<String>>; 3],
     /// Directory the host asked us to copy external resources into.
     pub resource_dir: RwLock<Option<String>>,
-    /// Report of the last Surge XT preset import (GUI display + logging).
-    pub surge_report: Mutex<crate::synth::surge::Report>,
 }
 
 fn migrate_legacy_sine(store: &ParamStore) {
@@ -161,7 +159,6 @@ impl Default for SharedState {
             custom_wavetables: [const { Mutex::new(None) }; 3],
             custom_wavetable_paths: [const { Mutex::new(None) }; 3],
             resource_dir: RwLock::new(None),
-            surge_report: Mutex::new(crate::synth::surge::Report::default()),
         }
     }
 }
@@ -249,23 +246,6 @@ impl SharedState {
 
     pub fn set_param_from_host(&self, id: ParamId, value: f64) {
         self.set_param_internal(id, value, false);
-    }
-
-    /// Import a Surge XT `.fxp` preset: converted parameters are applied to the
-    /// store (no per-param host notifications; one version bump at the end) and
-    /// the import report is kept for the GUI and the log.
-    pub fn load_surge_preset(&self, path: &Path) -> Result<(), String> {
-        let result = crate::synth::surge::load_preset(path)?;
-        for (id, value) in &result.values {
-            self.set_param_from_host(*id, *value);
-        }
-        let report = result.report.to_display_string();
-        if !report.is_empty() {
-            tracing::warn!("[surge] import report for '{}':\n{report}", result.name);
-        }
-        *self.surge_report.lock() = result.report;
-        self.bump_params_version();
-        Ok(())
     }
 
     pub fn save_synth_preset(&self, path: &Path) -> Result<(), String> {
@@ -540,7 +520,6 @@ pub(crate) fn build_voice_params(params: &ParamStore) -> VoiceParams {
     build_filter2_params(&mut result, params);
     build_amp_eg_params(&mut result, params);
     build_filter_eg_params(&mut result, params);
-    build_pitch_eg_params(&mut result, params);
     build_lfo_params(&mut result, params, 0);
     build_lfo_params(&mut result, params, 1);
     build_lfo_params(&mut result, params, 2);
@@ -684,7 +663,6 @@ fn build_step_seq_params(params: &mut VoiceParams, store: &ParamStore) {
     params.step_seq_shuffle = store.get(ParamId::StepSeqShuffle) as f32;
     params.step_seq_trig_amp = store.get(ParamId::StepSeqTrigAmp) as u16;
     params.step_seq_trig_filter = store.get(ParamId::StepSeqTrigFilter) as u16;
-    params.step_seq_trig_pitch = store.get(ParamId::StepSeqTrigPitch) as u16;
 }
 
 fn build_mseg_params(params: &mut VoiceParams, store: &ParamStore) {
@@ -960,7 +938,6 @@ fn build_mseg_params(params: &mut VoiceParams, store: &ParamStore) {
     params.mseg_loop_mode = MsegLoopMode::from_u8(store.get(ParamId::MsegLoopMode) as u8);
     params.mseg_retrig_amp = store.get(ParamId::MsegRetrigAmp) as u16;
     params.mseg_retrig_filter = store.get(ParamId::MsegRetrigFilter) as u16;
-    params.mseg_retrig_pitch = store.get(ParamId::MsegRetrigPitch) as u16;
 }
 
 fn build_filter1_params(params: &mut VoiceParams, store: &ParamStore) {
@@ -1059,28 +1036,6 @@ fn build_filter_eg_params(params: &mut VoiceParams, store: &ParamStore) {
         uber_release: store.get(ParamId::FilterEgUberRelease) as f32,
         gated_release: store.get_bool(ParamId::FilterEgGatedRelease),
         correct_analog_mode: store.get_bool(ParamId::FilterEgCorrectAnalog),
-    };
-}
-
-fn build_pitch_eg_params(params: &mut VoiceParams, store: &ParamStore) {
-    params.pitch_eg = EnvelopeSettings {
-        attack: store.get(ParamId::PitchAttack) as f32,
-        decay: store.get(ParamId::PitchDecay) as f32,
-        sustain: store.get(ParamId::PitchSustain) as f32,
-        release: store.get(ParamId::PitchRelease) as f32,
-        mode: if store.get(ParamId::PitchEgMode) > 0.5 {
-            EnvelopeMode::Analog
-        } else {
-            EnvelopeMode::Digital
-        },
-        attack_shape: AttackShape::from_u8(eg_attack(store, ParamId::PitchEgAttackCurve)),
-        decay_shape: DecayReleaseShape::from_u8(eg_decay(store, ParamId::PitchEgDecayCurve)),
-        release_shape: DecayReleaseShape::from_u8(eg_release(store, ParamId::PitchEgReleaseCurve)),
-        retrigger_mode: EnvelopeRetriggerMode::from_u8(store.get(ParamId::PitchEgRetrigger) as u8),
-        tempo_sync: store.get_bool(ParamId::PitchEgTempoSync),
-        uber_release: store.get(ParamId::PitchEgUberRelease) as f32,
-        gated_release: store.get_bool(ParamId::PitchEgGatedRelease),
-        correct_analog_mode: store.get_bool(ParamId::PitchEgCorrectAnalog),
     };
 }
 
@@ -1636,7 +1591,6 @@ struct ParamDirtyFlags {
     filters_routing_balance: bool,
     amp_eg: bool,
     filter_eg: bool,
-    pitch_eg: bool,
     oscs: bool,
     osc_globals: bool,
     lfos: [bool; 6],
@@ -1882,25 +1836,6 @@ fn apply_param_id_to_voice_params(
         | ParamId::FilterEgReleaseCurve => {
             build_filter_eg_params(params, store);
             dirty.filter_eg = true;
-            true
-        }
-
-        // Pitch EG
-        ParamId::PitchAttack
-        | ParamId::PitchDecay
-        | ParamId::PitchSustain
-        | ParamId::PitchRelease
-        | ParamId::PitchEgMode
-        | ParamId::PitchEgRetrigger
-        | ParamId::PitchEgTempoSync
-        | ParamId::PitchEgUberRelease
-        | ParamId::PitchEgGatedRelease
-        | ParamId::PitchEgCorrectAnalog
-        | ParamId::PitchEgAttackCurve
-        | ParamId::PitchEgDecayCurve
-        | ParamId::PitchEgReleaseCurve => {
-            build_pitch_eg_params(params, store);
-            dirty.pitch_eg = true;
             true
         }
 
@@ -2298,8 +2233,7 @@ fn apply_param_id_to_voice_params(
         | ParamId::StepSeqLoopEnd
         | ParamId::StepSeqShuffle
         | ParamId::StepSeqTrigAmp
-        | ParamId::StepSeqTrigFilter
-        | ParamId::StepSeqTrigPitch => {
+        | ParamId::StepSeqTrigFilter => {
             build_step_seq_params(params, store);
             dirty.step_seq = true;
             true
@@ -2565,8 +2499,7 @@ fn apply_param_id_to_voice_params(
         | ParamId::MsegLoopEnd
         | ParamId::MsegLoopMode
         | ParamId::MsegRetrigAmp
-        | ParamId::MsegRetrigFilter
-        | ParamId::MsegRetrigPitch => {
+        | ParamId::MsegRetrigFilter => {
             build_mseg_params(params, store);
             dirty.mseg = true;
             true
@@ -2872,9 +2805,6 @@ impl AudioProcessor {
                 }
                 if dirty.filter_eg {
                     self.engine.update_filter_eg_params();
-                }
-                if dirty.pitch_eg {
-                    self.engine.update_pitch_eg_params();
                 }
                 for i in 0..6 {
                     if dirty.lfos[i] {

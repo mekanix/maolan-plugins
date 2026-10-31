@@ -30,10 +30,6 @@ fn osc1_saw_test_engine() -> SynthEngine {
     engine.params.filter_feedback = 0.0;
     engine.params.lowcut_hz = 20.0;
 
-    engine.params.pitch_eg.attack = 0.0;
-    engine.params.pitch_eg.decay = 0.0;
-    engine.params.pitch_eg.sustain = 0.0;
-    engine.params.pitch_eg.release = 0.0;
     engine.params.portamento = 0.0;
     engine.params.drift_amount = 0.0;
 
@@ -184,10 +180,6 @@ fn test_osc1_only_single_pitch() {
     engine.params.noise.enabled = false;
     engine.params.waveshaper.enabled = false;
 
-    engine.params.pitch_eg.attack = 0.0;
-    engine.params.pitch_eg.decay = 0.0;
-    engine.params.pitch_eg.sustain = 0.0;
-    engine.params.pitch_eg.release = 0.0;
     engine.params.portamento = 0.0;
     engine.params.drift_amount = 0.0;
 
@@ -231,92 +223,6 @@ fn test_osc1_only_single_pitch() {
 }
 
 #[test]
-fn test_osc1_pitch_eg_effect() {
-    let mut engine = SynthEngine::new(48000.0, 8);
-    engine.params = VoiceParams::default();
-
-    engine.params.oscs[1].enabled = false;
-    engine.params.oscs[2].enabled = false;
-
-    engine.params.oscs[0].osc_type = OscType::Classic;
-    engine.params.oscs[0].waveform = 0;
-    engine.params.oscs[0].sub_level = 0.0;
-    engine.params.oscs[0].sync = 0.0;
-
-    engine.params.filter1.enabled = false;
-    engine.params.filter2.enabled = false;
-    engine.params.flavor = maolan_plugins::common::flavor::FlavorType::Off;
-    engine.params.noise.enabled = false;
-    engine.params.waveshaper.enabled = false;
-
-    engine.update_params();
-
-    let mut out_l = vec![0.0f32; 48000];
-    let mut out_r = vec![0.0f32; 48000];
-
-    engine.trigger(60, 0.8);
-    engine.process_block(&mut out_l, &mut out_r, None, None);
-
-    let start = 24000;
-    let mut crossings = vec![];
-    for i in (start + 1)..out_l.len() {
-        if out_l[i - 1] < 0.0 && out_l[i] >= 0.0 {
-            crossings.push(i);
-        }
-    }
-
-    if crossings.len() >= 2 {
-        let avg_period = (crossings.last().unwrap() - crossings.first().unwrap()) as f32
-            / (crossings.len() - 1) as f32;
-        let _est_freq = 48000.0 / avg_period;
-    }
-
-    let mut engine2 = SynthEngine::new(48000.0, 8);
-    engine2.params = VoiceParams::default();
-    engine2.params.oscs[1].enabled = false;
-    engine2.params.oscs[2].enabled = false;
-    engine2.params.oscs[0].osc_type = OscType::Classic;
-    engine2.params.oscs[0].waveform = 0;
-    engine2.params.oscs[0].sub_level = 0.0;
-    engine2.params.oscs[0].sync = 0.0;
-    engine2.params.filter1.enabled = false;
-    engine2.params.filter2.enabled = false;
-    engine2.params.flavor = maolan_plugins::common::flavor::FlavorType::Off;
-    engine2.params.noise.enabled = false;
-    engine2.params.waveshaper.enabled = false;
-    engine2.params.pitch_eg.attack = 0.0;
-    engine2.params.pitch_eg.decay = 0.0;
-    engine2.params.pitch_eg.sustain = 0.0;
-    engine2.params.pitch_eg.release = 0.0;
-    engine2.update_params();
-
-    out_l.fill(0.0);
-    out_r.fill(0.0);
-    engine2.trigger(60, 0.8);
-    engine2.process_block(&mut out_l, &mut out_r, None, None);
-
-    let start = 24000;
-    let mut crossings = vec![];
-    for i in (start + 1)..out_l.len() {
-        if out_l[i - 1] < 0.0 && out_l[i] >= 0.0 {
-            crossings.push(i);
-        }
-    }
-
-    if crossings.len() >= 2 {
-        let avg_period = (crossings.last().unwrap() - crossings.first().unwrap()) as f32
-            / (crossings.len() - 1) as f32;
-        let est_freq = 48000.0 / avg_period;
-        let ratio = est_freq / 261.63;
-        assert!(
-            ratio > 0.9 && ratio < 1.1,
-            "Frequency still wrong after disabling pitch_eg: {:.1} Hz",
-            est_freq
-        );
-    }
-}
-
-#[test]
 fn test_osc1_debug_freq() {
     let mut engine = SynthEngine::new(48000.0, 8);
     engine.params = VoiceParams::default();
@@ -333,11 +239,6 @@ fn test_osc1_debug_freq() {
     engine.params.flavor = maolan_plugins::common::flavor::FlavorType::Off;
     engine.params.noise.enabled = false;
     engine.params.waveshaper.enabled = false;
-
-    engine.params.pitch_eg.sustain = 0.0;
-    engine.params.pitch_eg.attack = 0.0;
-    engine.params.pitch_eg.decay = 0.0;
-    engine.params.pitch_eg.release = 0.0;
 
     engine.params.portamento = 0.0;
 
@@ -624,17 +525,16 @@ fn test_filter_family_switching_rebuilds_dsp() {
     let input: Vec<f32> = (0..block).map(|_| noise.next()).collect();
     let input_rms = rms(&input);
 
-    let mut filter = Filter::new(FilterType::Ladder, sr);
+    let mut filter = Filter::new(FilterType::DiodeLadder, sr);
     filter.set_params(800.0, 0.7);
     filter.prepare_block(800.0, 0.7, block);
-    let ladder: Vec<f32> = input.iter().map(|&s| filter.process(s)).collect();
-    assert!(matches!(filter, Filter::Ladder(_)));
+    let diode: Vec<f32> = input.iter().map(|&s| filter.process(s)).collect();
+    assert!(matches!(filter, Filter::DiodeLadder(_)));
 
-    // Ladder -> CytomicSvf: a different DSP family must be built.
     filter.set_filter_type(FilterType::CytomicLp);
     assert!(
         matches!(filter, Filter::CytomicSvf(_)),
-        "Ladder -> CytomicLp must rebuild the CytomicSvf variant"
+        "DiodeLadder -> CytomicLp must rebuild the CytomicSvf variant"
     );
     filter.prepare_block(800.0, 0.7, block);
     let cytomic: Vec<f32> = input.iter().map(|&s| filter.process(s)).collect();
@@ -649,14 +549,13 @@ fn test_filter_family_switching_rebuilds_dsp() {
     filter.prepare_block(800.0, 0.7, block);
     let svf: Vec<f32> = input.iter().map(|&s| filter.process(s)).collect();
 
-    // SVF -> Ladder: the reverse direction must rebuild too.
-    filter.set_filter_type(FilterType::Ladder);
+    filter.set_filter_type(FilterType::DiodeLadder);
     assert!(
-        matches!(filter, Filter::Ladder(_)),
-        "Lowpass -> Ladder must rebuild the Ladder variant"
+        matches!(filter, Filter::DiodeLadder(_)),
+        "Lowpass -> DiodeLadder must rebuild the DiodeLadder variant"
     );
 
-    for (name, seg) in [("ladder", &ladder), ("cytomic", &cytomic), ("svf", &svf)] {
+    for (name, seg) in [("diode", &diode), ("cytomic", &cytomic), ("svf", &svf)] {
         assert!(
             seg.iter().all(|s| s.is_finite()),
             "{name} segment contains NaN/INF"
@@ -665,7 +564,7 @@ fn test_filter_family_switching_rebuilds_dsp() {
 
     // All three families are lowpasses at 800 Hz, so each must attenuate
     // white noise well below the input level (a passthrough would not).
-    for (name, seg) in [("ladder", &ladder), ("cytomic", &cytomic), ("svf", &svf)] {
+    for (name, seg) in [("diode", &diode), ("cytomic", &cytomic), ("svf", &svf)] {
         let seg_rms = rms(seg);
         assert!(
             seg_rms < input_rms * 0.6,
@@ -674,7 +573,7 @@ fn test_filter_family_switching_rebuilds_dsp() {
     }
 
     // The families must not silently keep the previous family's DSP running.
-    let ladder_vs_cytomic = ladder
+    let diode_vs_cytomic = diode
         .iter()
         .zip(&cytomic)
         .map(|(a, b)| (a - b).abs())
@@ -687,8 +586,8 @@ fn test_filter_family_switching_rebuilds_dsp() {
         .sum::<f32>()
         / block as f32;
     assert!(
-        ladder_vs_cytomic > 1.0e-4,
-        "Ladder and Cytomic outputs identical (family switch was a no-op): {ladder_vs_cytomic}"
+        diode_vs_cytomic > 1.0e-4,
+        "Diode and Cytomic outputs identical (family switch was a no-op): {diode_vs_cytomic}"
     );
     assert!(
         cytomic_vs_svf > 1.0e-4,
@@ -704,7 +603,7 @@ fn test_filter_cutoff_preserved_across_family_switch() {
     let input: Vec<f32> = (0..block).map(|_| noise.next()).collect();
     let input_rms = rms(&input);
 
-    let mut filter = Filter::new(FilterType::Ladder, sr);
+    let mut filter = Filter::new(FilterType::DiodeLadder, sr);
     filter.set_params(800.0, 0.7);
     filter.prepare_block(800.0, 0.7, block);
     let _warmup: Vec<f32> = input.iter().map(|&s| filter.process(s)).collect();
@@ -1105,7 +1004,7 @@ fn test_filter_feedback_full_amount_stays_bounded() {
     // this configuration grew without bound.
     let mut engine = osc1_saw_test_engine();
     engine.params.filter1.enabled = true;
-    engine.params.filter1.filter_type = FilterType::Ladder;
+    engine.params.filter1.filter_type = FilterType::DiodeLadder;
     engine.params.filter1.cutoff_hz = 800.0;
     engine.params.filter1.resonance = 0.95;
     engine.params.filter_feedback = 1.0;

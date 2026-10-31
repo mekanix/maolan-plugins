@@ -407,7 +407,6 @@ pub enum ModSource {
     Lfo6 = 10,
     AmpEg = 11,
     FilterEg = 12,
-    PitchEg = 13,
     RandomBipolar = 14,
     RandomUnipolar = 15,
     AlternateBipolar = 16,
@@ -449,7 +448,6 @@ impl ModSource {
             10 => Some(ModSource::Lfo6),
             11 => Some(ModSource::AmpEg),
             12 => Some(ModSource::FilterEg),
-            13 => Some(ModSource::PitchEg),
             14 => Some(ModSource::RandomBipolar),
             15 => Some(ModSource::RandomUnipolar),
             16 => Some(ModSource::AlternateBipolar),
@@ -513,10 +511,6 @@ pub enum ModTarget {
     FilterDecay = 28,
     FilterSustain = 29,
     FilterRelease = 30,
-    PitchAttack = 31,
-    PitchDecay = 32,
-    PitchSustain = 33,
-    PitchRelease = 34,
     Lfo1Rate = 35,
     Lfo1Amount = 36,
     Lfo1Deform = 37,
@@ -601,10 +595,6 @@ impl ModTarget {
             28 => Some(ModTarget::FilterDecay),
             29 => Some(ModTarget::FilterSustain),
             30 => Some(ModTarget::FilterRelease),
-            31 => Some(ModTarget::PitchAttack),
-            32 => Some(ModTarget::PitchDecay),
-            33 => Some(ModTarget::PitchSustain),
-            34 => Some(ModTarget::PitchRelease),
             35 => Some(ModTarget::Lfo1Rate),
             36 => Some(ModTarget::Lfo1Amount),
             37 => Some(ModTarget::Lfo1Deform),
@@ -807,10 +797,6 @@ pub struct ModValues {
     filter_decay: f32,
     filter_sustain: f32,
     filter_release: f32,
-    pitch_attack: f32,
-    pitch_decay: f32,
-    pitch_sustain: f32,
-    pitch_release: f32,
     lfo1_rate: f32,
     lfo1_amount: f32,
     lfo1_deform: f32,
@@ -879,7 +865,6 @@ pub struct VoiceParams {
     pub filter_balance: f32,
     pub amp_eg: EnvelopeSettings,
     pub filter_eg: EnvelopeSettings,
-    pub pitch_eg: EnvelopeSettings,
     pub lfo1: LfoSettings,
     pub lfo2: LfoSettings,
     pub lfo3: LfoSettings,
@@ -937,10 +922,8 @@ pub struct VoiceParams {
     pub step_seq_shuffle: f32,
     pub step_seq_trig_amp: u16,
     pub step_seq_trig_filter: u16,
-    pub step_seq_trig_pitch: u16,
     pub mseg_retrig_amp: u16,
     pub mseg_retrig_filter: u16,
-    pub mseg_retrig_pitch: u16,
     pub mseg_nodes: [f32; MSEG_MAX_NODES],
     pub mseg_curves: [MsegCurve; MSEG_MAX_SEGMENTS],
     pub mseg_loop_start: usize,
@@ -981,13 +964,6 @@ impl Default for VoiceParams {
             filter_balance: 0.0,
             amp_eg: EnvelopeSettings::default(),
             filter_eg: EnvelopeSettings::default(),
-            pitch_eg: EnvelopeSettings {
-                attack: 0.0,
-                decay: 0.0,
-                sustain: 0.0,
-                release: 0.0,
-                ..EnvelopeSettings::default()
-            },
             lfo1: LfoSettings::default(),
             lfo2: LfoSettings::default(),
             lfo3: LfoSettings::default(),
@@ -1042,10 +1018,8 @@ impl Default for VoiceParams {
             step_seq_shuffle: 0.0,
             step_seq_trig_amp: 0,
             step_seq_trig_filter: 0,
-            step_seq_trig_pitch: 0,
             mseg_retrig_amp: 0,
             mseg_retrig_filter: 0,
-            mseg_retrig_pitch: 0,
             mseg_nodes: [0.0; MSEG_MAX_NODES],
             mseg_curves: [MsegCurve::Linear; MSEG_MAX_SEGMENTS],
             mseg_loop_start: 0,
@@ -1096,7 +1070,6 @@ pub struct Voice {
     lowcut_states_r2: [f32; 4],
     amp_eg: AdsrEnvelope,
     filter_eg: AdsrEnvelope,
-    pitch_eg: AdsrEnvelope,
     pub lfo1: Lfo,
     pub lfo2: Lfo,
     pub lfo3: Lfo,
@@ -1135,7 +1108,6 @@ pub struct Voice {
     latest_key: f32,
     amp_eg_output: f32,
     filter_eg_output: f32,
-    pitch_eg_output: f32,
 
     random_value: f32,
     alternate_sign: f32,
@@ -1191,7 +1163,6 @@ impl Voice {
             lowcut_states_r2: [0.0; 4],
             amp_eg: AdsrEnvelope::new(sample_rate),
             filter_eg: AdsrEnvelope::new(sample_rate),
-            pitch_eg: AdsrEnvelope::new(sample_rate),
             lfo1: Lfo::new(sample_rate),
             lfo2: Lfo::new(sample_rate),
             lfo3: Lfo::new(sample_rate),
@@ -1226,7 +1197,6 @@ impl Voice {
             latest_key: 0.0,
             amp_eg_output: 0.0,
             filter_eg_output: 0.0,
-            pitch_eg_output: 0.0,
             random_value: random::<f32>() * 2.0 - 1.0,
             alternate_sign: 1.0,
             note_counter: 0,
@@ -1258,7 +1228,6 @@ impl Voice {
         // redundant per-component setup on the audio thread.
         let amp_eg_changed = self.params.amp_eg != params.amp_eg;
         let filter_eg_changed = self.params.filter_eg != params.filter_eg;
-        let pitch_eg_changed = self.params.pitch_eg != params.pitch_eg;
 
         let step_seq_changed = self.params.step_seq_values != params.step_seq_values
             || self.params.step_seq_loop_start != params.step_seq_loop_start
@@ -1349,29 +1318,6 @@ impl Voice {
                 .set_gated_release(params.filter_eg.gated_release);
             self.filter_eg
                 .set_correct_analog_mode(params.filter_eg.correct_analog_mode);
-        }
-
-        if pitch_eg_changed {
-            self.pitch_eg.set_params(
-                params.pitch_eg.attack,
-                params.pitch_eg.decay,
-                params.pitch_eg.sustain,
-                params.pitch_eg.release,
-            );
-            self.pitch_eg.set_mode(params.pitch_eg.mode);
-            self.pitch_eg.set_shapes(
-                params.pitch_eg.attack_shape,
-                params.pitch_eg.decay_shape,
-                params.pitch_eg.release_shape,
-            );
-            self.pitch_eg
-                .set_retrigger_mode(params.pitch_eg.retrigger_mode);
-            self.pitch_eg.set_tempo_sync(params.pitch_eg.tempo_sync);
-            self.pitch_eg.set_uber_release(params.pitch_eg.uber_release);
-            self.pitch_eg
-                .set_gated_release(params.pitch_eg.gated_release);
-            self.pitch_eg
-                .set_correct_analog_mode(params.pitch_eg.correct_analog_mode);
         }
 
         if lfo1_changed {
@@ -1955,30 +1901,6 @@ impl Voice {
             .set_correct_analog_mode(params.filter_eg.correct_analog_mode);
     }
 
-    pub fn update_pitch_eg_params(&mut self, params: &VoiceParams) {
-        self.params.pitch_eg = params.pitch_eg.clone();
-        self.pitch_eg.set_params(
-            params.pitch_eg.attack,
-            params.pitch_eg.decay,
-            params.pitch_eg.sustain,
-            params.pitch_eg.release,
-        );
-        self.pitch_eg.set_mode(params.pitch_eg.mode);
-        self.pitch_eg.set_shapes(
-            params.pitch_eg.attack_shape,
-            params.pitch_eg.decay_shape,
-            params.pitch_eg.release_shape,
-        );
-        self.pitch_eg
-            .set_retrigger_mode(params.pitch_eg.retrigger_mode);
-        self.pitch_eg.set_tempo_sync(params.pitch_eg.tempo_sync);
-        self.pitch_eg.set_uber_release(params.pitch_eg.uber_release);
-        self.pitch_eg
-            .set_gated_release(params.pitch_eg.gated_release);
-        self.pitch_eg
-            .set_correct_analog_mode(params.pitch_eg.correct_analog_mode);
-    }
-
     pub fn update_lfo_params(&mut self, params: &VoiceParams, idx: usize) {
         let settings = match idx {
             0 => {
@@ -2227,7 +2149,6 @@ impl Voice {
         self.filter2_r = Filter::new(self.params.filter2.filter_type, sample_rate);
         self.amp_eg.set_sample_rate(sample_rate);
         self.filter_eg.set_sample_rate(sample_rate);
-        self.pitch_eg.set_sample_rate(sample_rate);
         self.lfo1.set_sample_rate(sample_rate);
         self.lfo2.set_sample_rate(sample_rate);
         self.lfo3.set_sample_rate(sample_rate);
@@ -2246,7 +2167,6 @@ impl Voice {
     pub fn set_eg_tempo(&mut self, tempo_bpm: f32) {
         self.amp_eg.set_tempo(tempo_bpm);
         self.filter_eg.set_tempo(tempo_bpm);
-        self.pitch_eg.set_tempo(tempo_bpm);
     }
 
     pub fn set_key_mod_values(&mut self, lowest: f32, highest: f32, latest: f32) {
@@ -2291,7 +2211,6 @@ impl Voice {
 
         self.amp_eg.trigger();
         self.filter_eg.trigger();
-        self.pitch_eg.trigger();
         self.last_scale_degree = freq_to_scale_degree(self.target_freq, &self.tuning);
 
         self.lfo1.reset();
@@ -2328,14 +2247,12 @@ impl Voice {
         self.uber_fade = 1.0;
         self.amp_eg.release();
         self.filter_eg.release();
-        self.pitch_eg.release();
     }
 
     pub fn release(&mut self) {
         self.gate = false;
         self.amp_eg.release();
         self.filter_eg.release();
-        self.pitch_eg.release();
         self.lfo1.release();
         self.lfo2.release();
         self.lfo3.release();
@@ -2376,7 +2293,6 @@ impl Voice {
             ModSource::Lfo6 => self.lfo6_output,
             ModSource::AmpEg => self.amp_eg_output,
             ModSource::FilterEg => self.filter_eg_output,
-            ModSource::PitchEg => self.pitch_eg_output,
             ModSource::RandomBipolar => self.random_value,
             ModSource::RandomUnipolar => (self.random_value + 1.0) * 0.5,
             ModSource::AlternateBipolar => self.alternate_sign,
@@ -2481,10 +2397,6 @@ impl Voice {
                 ModTarget::FilterDecay => vals.filter_decay += delta,
                 ModTarget::FilterSustain => vals.filter_sustain += delta,
                 ModTarget::FilterRelease => vals.filter_release += delta,
-                ModTarget::PitchAttack => vals.pitch_attack += delta,
-                ModTarget::PitchDecay => vals.pitch_decay += delta,
-                ModTarget::PitchSustain => vals.pitch_sustain += delta,
-                ModTarget::PitchRelease => vals.pitch_release += delta,
                 ModTarget::Lfo1Rate => vals.lfo1_rate += delta,
                 ModTarget::Lfo1Amount => vals.lfo1_amount += delta,
                 ModTarget::Lfo1Deform => vals.lfo1_deform += delta,
@@ -3115,7 +3027,6 @@ impl Voice {
 
                 self.amp_eg_output = self.amp_eg.next();
                 self.filter_eg_output = self.filter_eg.next();
-                self.pitch_eg_output = self.pitch_eg.next();
                 self.lfo1_output = self.lfo1.next();
                 self.lfo2_output = self.lfo2.next();
                 self.lfo3_output = self.lfo3.next();
@@ -3185,10 +3096,8 @@ impl Voice {
                     }
                 };
                 let pb_mul = 2.0f32.powf(self.pitch_bend * pb_range / 12.0);
-                let pitch_eg_mul = 2.0f32.powf(self.pitch_eg_output * 2.0);
                 let lfo5_pitch_mul = 2.0f32.powf(self.lfo5_output * 50.0 / 1200.0);
-                self.oscillators[0]
-                    .set_freq_hz(self.current_freq * pb_mul * pitch_eg_mul * lfo5_pitch_mul);
+                self.oscillators[0].set_freq_hz(self.current_freq * pb_mul * lfo5_pitch_mul);
 
                 let (osc1_l, osc1_r) = self.oscillators[0].next(0.0, audio_l, audio_r);
 
@@ -3196,7 +3105,6 @@ impl Voice {
                 let lfo6_pitch_mul = 2.0f32.powf(self.lfo6_output * 50.0 / 1200.0);
                 let osc2_freq = self.current_freq
                     * pb_mul
-                    * pitch_eg_mul
                     * lfo6_pitch_mul
                     * 2.0f32.powi(osc2_settings.octave as i32)
                     * 2.0f32.powf(osc2_settings.semitone as f32 / 12.0)
@@ -3210,7 +3118,6 @@ impl Voice {
                 let osc3_settings = &self.params.oscs[2];
                 let osc3_freq = self.current_freq
                     * pb_mul
-                    * pitch_eg_mul
                     * 2.0f32.powi(osc3_settings.octave as i32)
                     * 2.0f32.powf(osc3_settings.semitone as f32 / 12.0)
                     * 2.0f32.powf(osc3_settings.fine / 1200.0);
@@ -3419,7 +3326,6 @@ impl Voice {
                 if current_degree != self.last_scale_degree {
                     self.amp_eg.trigger();
                     self.filter_eg.trigger();
-                    self.pitch_eg.trigger();
                     self.last_scale_degree = current_degree;
                 }
             } else {
@@ -3487,15 +3393,6 @@ impl Voice {
                 .set_sustain((self.params.filter_eg.sustain + mods.filter_sustain).clamp(0.0, 1.0));
             self.filter_eg
                 .set_release((self.params.filter_eg.release + mods.filter_release).max(0.0));
-            self.pitch_eg
-                .set_attack((self.params.pitch_eg.attack + mods.pitch_attack).max(0.0));
-            self.pitch_eg
-                .set_decay((self.params.pitch_eg.decay + mods.pitch_decay).max(0.0));
-            self.pitch_eg
-                .set_sustain((self.params.pitch_eg.sustain + mods.pitch_sustain).clamp(0.0, 1.0));
-            self.pitch_eg
-                .set_release((self.params.pitch_eg.release + mods.pitch_release).max(0.0));
-
             self.lfo1_output = self.lfo1.next();
             self.lfo2_output = self.lfo2.next();
             self.lfo3_output = self.lfo3.next();
@@ -3520,9 +3417,6 @@ impl Voice {
                     if self.params.step_seq_trig_filter & mask != 0 {
                         self.filter_eg.trigger();
                     }
-                    if self.params.step_seq_trig_pitch & mask != 0 {
-                        self.pitch_eg.trigger();
-                    }
                 }
                 if *shape == LfoShape::Mseg && lfo.mseg_seg_changed {
                     let mask = 1u16 << lfo.mseg_prev_seg.min(15);
@@ -3532,15 +3426,11 @@ impl Voice {
                     if self.params.mseg_retrig_filter & mask != 0 {
                         self.filter_eg.trigger();
                     }
-                    if self.params.mseg_retrig_pitch & mask != 0 {
-                        self.pitch_eg.trigger();
-                    }
                 }
             }
 
             self.amp_eg_output = self.amp_eg.next();
             self.filter_eg_output = self.filter_eg.next();
-            self.pitch_eg_output = self.pitch_eg.next();
 
             self.update_oscillator_freqs(&mods);
 
@@ -3911,7 +3801,6 @@ impl Voice {
             self.pitch_bend_smooth_state = self.pitch_bend;
         }
 
-        let pitch_eg_mod = self.pitch_eg_output * 2.0;
         let pb_range = if self.pitch_bend_smooth_state >= 0.0 {
             if self.params.pitch_bend_up > 0.0 {
                 self.params.pitch_bend_up
@@ -3949,7 +3838,7 @@ impl Voice {
             let octave_mul = 2.0f32.powi(settings.octave as i32);
             let semitone_mul = 2.0f32.powf(settings.semitone as f32 / 12.0);
             let fine_mul = 2.0f32.powf(settings.fine / 1200.0);
-            let pitch_mod_mul = 2.0f32.powf(mods.osc_pitch[idx] + pitch_eg_mod);
+            let pitch_mod_mul = 2.0f32.powf(mods.osc_pitch[idx]);
             let drift_cents = self.drift_phase[idx] * drift_amount * 20.0;
             let drift_mul = 2.0f32.powf(drift_cents / 1200.0);
 

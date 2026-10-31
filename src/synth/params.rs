@@ -72,12 +72,6 @@ pub enum ParamId {
     FilterRelease = 54,
     FilterEgMode = 55,
 
-    PitchAttack = 56,
-    PitchDecay = 57,
-    PitchSustain = 58,
-    PitchRelease = 59,
-    PitchEgMode = 60,
-
     Lfo1Rate = 61,
     Lfo1Shape = 62,
     Lfo1Amount = 63,
@@ -316,7 +310,6 @@ pub enum ParamId {
     PitchBendDown = 267,
     AmpEgRetrigger = 268,
     FilterEgRetrigger = 269,
-    PitchEgRetrigger = 270,
     StealMode = 271,
     PortamentoSync = 272,
     PortamentoRetrigger = 273,
@@ -330,10 +323,8 @@ pub enum ParamId {
     Lfo6EnvTempoSync = 281,
     AmpEgTempoSync = 282,
     FilterEgTempoSync = 283,
-    PitchEgTempoSync = 284,
     StepSeqTrigAmp = 285,
     StepSeqTrigFilter = 286,
-    StepSeqTrigPitch = 287,
     F1FeedbackDrive = 288,
     F2FeedbackDrive = 289,
     Osc1FmDepth = 290,
@@ -366,12 +357,10 @@ pub enum ParamId {
     Fm2Feedback = 317,
     AmpEgUberRelease = 318,
     FilterEgUberRelease = 319,
-    PitchEgUberRelease = 320,
     StringStereoSpread = 321,
     WavetableKeytrack = 322,
     AmpEgGatedRelease = 323,
     FilterEgGatedRelease = 324,
-    PitchEgGatedRelease = 325,
     TuningScale = 326,
     TuningRoot = 327,
     TuningSclIndex = 393,
@@ -713,9 +702,6 @@ pub enum ParamId {
     FilterEgAttackCurve = 659,
     FilterEgDecayCurve = 660,
     FilterEgReleaseCurve = 661,
-    PitchEgAttackCurve = 662,
-    PitchEgDecayCurve = 663,
-    PitchEgReleaseCurve = 664,
     Osc1Solo = 665,
     Osc2Solo = 666,
     Osc3Solo = 667,
@@ -729,10 +715,8 @@ pub enum ParamId {
     TwistLpgDecay = 675,
     AmpEgCorrectAnalog = 676,
     FilterEgCorrectAnalog = 677,
-    PitchEgCorrectAnalog = 678,
     MsegRetrigAmp = 679,
     MsegRetrigFilter = 680,
-    MsegRetrigPitch = 681,
     AliasPartial1 = 682,
     AliasPartial2 = 683,
     AliasPartial3 = 684,
@@ -1058,43 +1042,6 @@ pub static PARAMS: &[ParamDef] = &[
         0.01
     ),
     def_enum!(ParamId::FilterEgMode, "Mode", "FilterEG", 0.0, 0.0),
-    def_automatable!(
-        ParamId::PitchAttack,
-        "Attack",
-        "PitchEG",
-        0.0,
-        10.0,
-        0.0,
-        0.01
-    ),
-    def_automatable!(
-        ParamId::PitchDecay,
-        "Decay",
-        "PitchEG",
-        0.0,
-        10.0,
-        0.0,
-        0.01
-    ),
-    def_automatable!(
-        ParamId::PitchSustain,
-        "Sustain",
-        "PitchEG",
-        0.0,
-        1.0,
-        0.0,
-        0.01
-    ),
-    def_automatable!(
-        ParamId::PitchRelease,
-        "Release",
-        "PitchEG",
-        0.0,
-        10.0,
-        0.0,
-        0.01
-    ),
-    def_enum!(ParamId::PitchEgMode, "Mode", "PitchEG", 0.0, 0.0),
     def_automatable!(ParamId::Lfo1Rate, "Rate", "LFO1", 0.01, 100.0, 1.0, 0.01),
     def_enum!(ParamId::Lfo1Shape, "Shape", "LFO1", 9.0, 0.0),
     def_automatable!(ParamId::Lfo1Amount, "Amount", "LFO1", 0.0, 1.0, 0.0, 0.01),
@@ -1341,15 +1288,6 @@ pub static PARAMS: &[ParamDef] = &[
         0.01
     ),
     def_automatable!(
-        ParamId::PitchEgUberRelease,
-        "Uber Release",
-        "PitchEG",
-        0.0,
-        1.0,
-        0.0,
-        0.01
-    ),
-    def_automatable!(
         ParamId::StringStereoSpread,
         "Stereo Spread",
         "String",
@@ -1363,12 +1301,6 @@ pub static PARAMS: &[ParamDef] = &[
         ParamId::FilterEgGatedRelease,
         "Gated Release",
         "FilterEG",
-        0.0
-    ),
-    def_toggle!(
-        ParamId::PitchEgGatedRelease,
-        "Gated Release",
-        "PitchEG",
         0.0
     ),
     def_automatable!(
@@ -1455,8 +1387,8 @@ pub static PARAMS: &[ParamDef] = &[
     ),
     def_enum!(ParamId::OscFmMode, "FM Mode", "Osc", 9.0, 0.0),
     def_automatable!(ParamId::OscFmDepth, "FM Depth", "Osc", 0.0, 1.0, 0.5, 0.01),
-    def_enum!(ParamId::F1Subtype, "Subtype", "Filter1", 21.0, 0.0),
-    def_enum!(ParamId::F2Subtype, "Subtype", "Filter2", 21.0, 0.0),
+    def_enum!(ParamId::F1Subtype, "Subtype", "Filter1", 6.0, 0.0),
+    def_enum!(ParamId::F2Subtype, "Subtype", "Filter2", 6.0, 0.0),
     def_automatable!(
         ParamId::FilterBalance,
         "Balance",
@@ -2039,7 +1971,6 @@ pub static PARAMS: &[ParamDef] = &[
         1.0,
         0.0
     ),
-    def_enum!(ParamId::PitchEgRetrigger, "Retrigger", "PitchEG", 1.0, 0.0),
     def_enum!(ParamId::StealMode, "Steal Mode", "Global", 1.0, 0.0),
     def_toggle!(ParamId::PortamentoSync, "Tempo Sync", "Global", 0.0),
     def_toggle!(
@@ -2066,7 +1997,6 @@ pub static PARAMS: &[ParamDef] = &[
     def_toggle!(ParamId::Lfo6EnvTempoSync, "Env Tempo Sync", "LFO6", 0.0),
     def_toggle!(ParamId::AmpEgTempoSync, "Tempo Sync", "AmpEG", 0.0),
     def_toggle!(ParamId::FilterEgTempoSync, "Tempo Sync", "FilterEG", 0.0),
-    def_toggle!(ParamId::PitchEgTempoSync, "Tempo Sync", "PitchEG", 0.0),
     def_automatable!(
         ParamId::StepSeqTrigAmp,
         "Trig Amp",
@@ -2079,15 +2009,6 @@ pub static PARAMS: &[ParamDef] = &[
     def_automatable!(
         ParamId::StepSeqTrigFilter,
         "Trig Filter",
-        "StepSeq",
-        0.0,
-        65535.0,
-        0.0,
-        1.0
-    ),
-    def_automatable!(
-        ParamId::StepSeqTrigPitch,
-        "Trig Pitch",
         "StepSeq",
         0.0,
         65535.0,
@@ -3121,27 +3042,6 @@ pub static PARAMS: &[ParamDef] = &[
         3.0,
         0.0
     ),
-    def_enum!(
-        ParamId::PitchEgAttackCurve,
-        "Attack Curve",
-        "Pitch EG",
-        3.0,
-        0.0
-    ),
-    def_enum!(
-        ParamId::PitchEgDecayCurve,
-        "Decay Curve",
-        "Pitch EG",
-        3.0,
-        0.0
-    ),
-    def_enum!(
-        ParamId::PitchEgReleaseCurve,
-        "Release Curve",
-        "Pitch EG",
-        3.0,
-        0.0
-    ),
     def_toggle!(ParamId::Osc1Solo, "Solo", "Osc1", 0.0),
     def_toggle!(ParamId::Osc2Solo, "Solo", "Osc2", 0.0),
     def_toggle!(ParamId::Osc3Solo, "Solo", "Osc3", 0.0),
@@ -3176,12 +3076,6 @@ pub static PARAMS: &[ParamDef] = &[
         "Filter EG",
         0.0
     ),
-    def_toggle!(
-        ParamId::PitchEgCorrectAnalog,
-        "Correct Analog",
-        "Pitch EG",
-        0.0
-    ),
     def_automatable!(
         ParamId::MsegRetrigAmp,
         "Retrig Amp",
@@ -3194,15 +3088,6 @@ pub static PARAMS: &[ParamDef] = &[
     def_automatable!(
         ParamId::MsegRetrigFilter,
         "Retrig Filter",
-        "MSEG",
-        0.0,
-        65535.0,
-        0.0,
-        1.0
-    ),
-    def_automatable!(
-        ParamId::MsegRetrigPitch,
-        "Retrig Pitch",
         "MSEG",
         0.0,
         65535.0,
